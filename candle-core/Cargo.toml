@@ -36,6 +36,12 @@ yoke = { workspace = true }
 zip = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokenizers = { workspace = true, features = ["onig"] }
+# `pollster` bridges the async wgpu adapter / device negotiation into a
+# synchronous constructor on native targets. Native-only — on wasm32 we
+# expose only `WgpuDevice::new_async` because blocking the JS event loop
+# would deadlock the browser. The dep is gated by the `wgpu` feature via
+# `optional = true` so it does not pull in on default builds.
+pollster = { version = "0.4", optional = true }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
@@ -59,7 +65,11 @@ metal = [
     "candle-ug?/metal",
 ]
 ug = ["dep:candle-ug"]
-wgpu = ["dep:wgpu"]
+wgpu = ["dep:wgpu", "dep:pollster"]
+# Note: `dep:pollster` is declared under
+# `[target.'cfg(not(target_arch = "wasm32"))'.dependencies]`. Cargo handles
+# the cross-cutting feature flag transparently — on wasm32 the feature is
+# satisfied by `dep:wgpu` only and the `pollster` dep is simply ignored.
 
 [[bench]]
 name = "bench_main"
