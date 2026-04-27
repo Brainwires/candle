@@ -1,11 +1,9 @@
 //! WebGPU (wgpu) backend for candle.
 //!
-//! This is the scaffolding for Phase 3.1 of the brainwires bright-scroll
-//! plan. The device, storage, and ops are stubs that return
-//! [`Error::Msg`] with `"wgpu: not yet implemented"`. Subsequent phases
-//! fill in real implementations:
+//! Phase 3.2 wires real allocation + CPU↔GPU copy on top of the
+//! Phase 3.1 scaffolding. Compute kernels still come in later phases:
 //!
-//! - 3.2: Tensor storage on GPU buffers (`WgpuStorage`, alloc/copy).
+//! - 3.2: Tensor storage on GPU buffers (`WgpuStorage`, alloc/copy). ✅
 //! - 3.3: Matmul kernel.
 //! - 3.4: Element-wise ops.
 //! - 3.5: Reduction ops (sum, max, mean, softmax, layer/rms norm).

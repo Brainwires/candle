@@ -7,8 +7,19 @@ use crate::{CpuStorage, DType, Result, Shape, Storage, WithDType};
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum DeviceLocation {
     Cpu,
-    Cuda { gpu_id: usize },
-    Metal { gpu_id: usize },
+    Cuda {
+        gpu_id: usize,
+    },
+    Metal {
+        gpu_id: usize,
+    },
+    /// WebGPU device. `gpu_id` is always `0` for now — multi-adapter
+    /// selection is out of scope until we have a use case (see
+    /// `BackendDevice::new` in the wgpu backend).
+    #[cfg(feature = "wgpu")]
+    Wgpu {
+        gpu_id: usize,
+    },
 }
 
 /// Cpu, Cuda, or Metal
@@ -267,14 +278,24 @@ impl Device {
 
     /// Construct a new WebGPU device.
     ///
-    /// Phase 3.1 stub: always returns an error. Phase 3.2 wires real
-    /// adapter/device negotiation via `wgpu::Instance`. The async
-    /// version (and its wasm32 spawning story) lands with the PWA in
-    /// Phase 3.8.
+    /// Sync constructor — only available on native targets. On wasm32
+    /// use [`crate::WgpuDevice::new_async`] from your async context and
+    /// wrap the result with `Device::Wgpu(...)` yourself; the PWA wiring
+    /// in Phase 3.8 takes care of that.
+    ///
+    /// `ordinal` is currently ignored — wgpu picks the high-performance
+    /// adapter the platform reports. Multi-adapter selection is out of
+    /// scope until we have a use case.
+    #[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+    pub fn new_wgpu(_ordinal: usize) -> Result<Self> {
+        Ok(Self::Wgpu(crate::WgpuDevice::new()?))
+    }
+
+    /// Async WebGPU device constructor — available on every target,
+    /// including wasm32 where the sync version is not.
     #[cfg(feature = "wgpu")]
-    pub fn new_wgpu(ordinal: usize) -> Result<Self> {
-        use crate::backend::BackendDevice;
-        Ok(Self::Wgpu(crate::WgpuDevice::new(ordinal)?))
+    pub async fn new_wgpu_async(_ordinal: usize) -> Result<Self> {
+        Ok(Self::Wgpu(crate::WgpuDevice::new_async().await?))
     }
 
     pub fn set_seed(&self, seed: u64) -> Result<()> {
