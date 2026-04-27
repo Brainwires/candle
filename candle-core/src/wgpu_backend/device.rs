@@ -330,3 +330,16 @@ fn _assert_backend_device() {
     fn is_backend_storage<S: BackendStorage<Device = WgpuDevice>>() {}
     is_backend_storage::<WgpuStorage>();
 }
+
+// wasm32 is single-threaded — there is no real thread to race against.
+// wgpu's JS-backed handles are !Send+!Sync because the browser's WebGPU
+// objects are tied to the main thread, but on wasm32-unknown-unknown
+// there IS only one thread, so the assertion is sound.
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for WgpuDevice {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for WgpuDevice {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for WgpuDeviceInner {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for WgpuDeviceInner {}

@@ -582,3 +582,8 @@ impl BackendStorage for WgpuStorage {
 // of `cpu_storage_bytes` ends up calling a typed slice helper.
 #[allow(dead_code)]
 fn _silence_cpu_storage_ref(_: CpuStorageRef<'_>) {}
+
+#[cfg(target_arch = "wasm32")]
+unsafe impl Send for WgpuStorage {}
+#[cfg(target_arch = "wasm32")]
+unsafe impl Sync for WgpuStorage {}
