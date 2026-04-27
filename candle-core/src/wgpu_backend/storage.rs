@@ -547,21 +547,30 @@ impl BackendStorage for WgpuStorage {
         super::ops::matmul::matmul(self, rhs, bmnk, lhs_layout, rhs_layout)
     }
 
-    fn copy_strided_src(&self, _: &mut Self, _: usize, _: &Layout) -> Result<()> {
-        Self::not_implemented("copy_strided_src")
+    fn copy_strided_src(&self, dst: &mut Self, dst_offset: usize, src_l: &Layout) -> Result<()> {
+        super::ops::copy::copy_strided_src(self, dst, dst_offset, src_l)
     }
 
     fn copy2d(
         &self,
-        _: &mut Self,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
-        _: usize,
+        dst: &mut Self,
+        d1: usize,
+        d2: usize,
+        src_stride1: usize,
+        dst_stride1: usize,
+        src_offset: usize,
+        dst_offset: usize,
     ) -> Result<()> {
-        Self::not_implemented("copy2d")
+        super::ops::copy::copy2d(
+            self,
+            dst,
+            d1,
+            d2,
+            src_stride1,
+            dst_stride1,
+            src_offset,
+            dst_offset,
+        )
     }
 
     fn const_set(&mut self, _: crate::scalar::Scalar, _: &Layout) -> Result<()> {

@@ -223,6 +223,20 @@ impl candle::CustomOp3 for RotaryEmbI {
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::wgpu_backend::ops::rope::{rope as rope_dispatch, RopeVariant};
+        rope_dispatch(RopeVariant::Interleaved, s1, l1, s2, l2, s3, l3)
+    }
 }
 
 fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
@@ -507,6 +521,20 @@ impl candle::CustomOp3 for RotaryEmb {
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::wgpu_backend::ops::rope::{rope as rope_dispatch, RopeVariant};
+        rope_dispatch(RopeVariant::SplitHalves, s1, l1, s2, l2, s3, l3)
+    }
 }
 
 pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -777,6 +805,20 @@ impl candle::CustomOp3 for RotaryEmbThd {
         .map_err(candle::Error::wrap)?;
         let out = candle::MetalStorage::new(output, device.clone(), el, src.dtype());
         Ok((out, l_src.shape().clone()))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        s1: &candle::WgpuStorage,
+        l1: &Layout,
+        s2: &candle::WgpuStorage,
+        l2: &Layout,
+        s3: &candle::WgpuStorage,
+        l3: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        use candle::wgpu_backend::ops::rope::{rope as rope_dispatch, RopeVariant};
+        rope_dispatch(RopeVariant::SplitHalvesThd, s1, l1, s2, l2, s3, l3)
     }
 }
 

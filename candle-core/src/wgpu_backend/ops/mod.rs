@@ -7,6 +7,8 @@
 
 pub(crate) mod affine;
 pub(crate) mod binary;
+pub(crate) mod copy;
 pub(crate) mod matmul;
 pub(crate) mod reduce;
+pub mod rope;
 pub(crate) mod unary;

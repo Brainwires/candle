@@ -257,9 +257,10 @@ impl Storage {
                 Ok((Self::Metal(storage), shape))
             }
             #[cfg(feature = "wgpu")]
-            Self::Wgpu(_) => Err(Error::Msg(
-                "wgpu: CustomOp1 forward not yet implemented (Phase 3.2+)".into(),
-            )),
+            Self::Wgpu(storage) => {
+                let (storage, shape) = c.wgpu_fwd(storage, l)?;
+                Ok((Self::Wgpu(storage), shape))
+            }
         }
     }
 
@@ -283,6 +284,11 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2)) => {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2)?;
                 Ok((Self::Metal(s), shape))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2)?;
+                Ok((Self::Wgpu(s), shape))
             }
             _ => unreachable!(),
         }
@@ -311,6 +317,11 @@ impl Storage {
             (Self::Metal(s1), Self::Metal(s2), Self::Metal(s3)) => {
                 let (s, shape) = c.metal_fwd(s1, l1, s2, l2, s3, l3)?;
                 Ok((Self::Metal(s), shape))
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(s1), Self::Wgpu(s2), Self::Wgpu(s3)) => {
+                let (s, shape) = c.wgpu_fwd(s1, l1, s2, l2, s3, l3)?;
+                Ok((Self::Wgpu(s), shape))
             }
             _ => unreachable!(),
         }
@@ -899,6 +910,8 @@ impl Storage {
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy_strided_src(dst, dst_offset, src_l)?)
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => src.copy_strided_src(dst, dst_offset, src_l),
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),
@@ -926,6 +939,10 @@ impl Storage {
             }
             (Self::Metal(src), Self::Metal(dst)) => {
                 Ok(src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)?)
+            }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(src), Self::Wgpu(dst)) => {
+                src.copy2d(dst, d1, d2, src_s, dst_s, src_o, dst_o)
             }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),

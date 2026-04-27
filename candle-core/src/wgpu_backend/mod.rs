@@ -19,7 +19,7 @@
 //! once Phase 3.8 wires `web-sys` GPU bindings.
 
 mod device;
-mod ops;
+pub mod ops;
 mod storage;
 
 pub use device::WgpuDevice;

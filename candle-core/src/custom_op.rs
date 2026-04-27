@@ -3,6 +3,9 @@ use crate::tensor::from_storage;
 use crate::{CpuStorage, CudaStorage, Layout, MetalStorage, Result, Shape, Tensor};
 use std::sync::Arc;
 
+#[cfg(feature = "wgpu")]
+use crate::wgpu_backend::WgpuStorage;
+
 /// Unary ops that can be defined in user-land.
 pub trait CustomOp1 {
     // Box<dyn> does not support const yet, so use a function to get the name.
@@ -30,6 +33,17 @@ pub trait CustomOp1 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a WebGPU device. Default implementation
+    /// errors out — backends opt in by overriding this. Phase 3.6 wires
+    /// the rotary-embedding ops in `candle-nn`.
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(&self, _storage: &WgpuStorage, _layout: &Layout) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
     }
 
     /// This function takes as argument the argument `arg` used in the forward pass, the result
@@ -79,6 +93,21 @@ pub trait CustomOp2 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a WebGPU device.
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
     }
 
     fn bwd(
@@ -137,6 +166,23 @@ pub trait CustomOp3 {
         Err(crate::Error::Metal(
             format!("no metal implementation for {}", self.name()).into(),
         ))
+    }
+
+    /// The forward pass, as run on a WebGPU device.
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+        _: &WgpuStorage,
+        _: &Layout,
+    ) -> Result<(WgpuStorage, Shape)> {
+        Err(crate::Error::Msg(format!(
+            "no wgpu implementation for {}",
+            self.name()
+        )))
     }
 
     fn bwd(
