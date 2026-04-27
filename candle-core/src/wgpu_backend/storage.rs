@@ -404,8 +404,8 @@ impl BackendStorage for WgpuStorage {
         Self::not_implemented("cmp")
     }
 
-    fn to_dtype(&self, _: &Layout, _: DType) -> Result<Self> {
-        Self::not_implemented("to_dtype")
+    fn to_dtype(&self, layout: &Layout, dtype: DType) -> Result<Self> {
+        super::ops::cast::to_dtype(self, layout, dtype)
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {

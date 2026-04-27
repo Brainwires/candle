@@ -6,6 +6,7 @@
 //! Phases 3.4+ add elementwise / reductions / attention ops alongside.
 
 pub(crate) mod affine;
+pub(crate) mod cast;
 pub(crate) mod index_select;
 pub(crate) mod binary;
 pub(crate) mod copy;
