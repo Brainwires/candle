@@ -867,6 +867,11 @@ impl Storage {
                 let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            (Self::Wgpu(lhs), Self::Wgpu(rhs)) => {
+                let storage = lhs.matmul(rhs, bmnk, lhs_layout, rhs_layout)?;
+                Ok(Self::Wgpu(storage))
+            }
             (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
                 lhs: lhs.device().location(),
                 rhs: rhs.device().location(),

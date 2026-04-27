@@ -229,6 +229,23 @@ impl WgpuStorage {
         })
     }
 
+    /// Wrap an existing `wgpu::Buffer` produced by a compute kernel as
+    /// a `WgpuStorage`. Used by ops modules (`super::ops`) when they
+    /// allocate output buffers themselves.
+    pub(crate) fn from_raw_buffer(
+        buffer: Arc<wgpu::Buffer>,
+        len: usize,
+        dtype: DType,
+        device: WgpuDevice,
+    ) -> Self {
+        Self {
+            buffer,
+            len,
+            dtype,
+            device,
+        }
+    }
+
     /// Read the GPU buffer back into a `CpuStorage`.
     ///
     /// Strategy: create a `MAP_READ | COPY_DST` staging buffer the same
@@ -517,12 +534,12 @@ impl BackendStorage for WgpuStorage {
 
     fn matmul(
         &self,
-        _: &Self,
-        _: (usize, usize, usize, usize),
-        _: &Layout,
-        _: &Layout,
+        rhs: &Self,
+        bmnk: (usize, usize, usize, usize),
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
     ) -> Result<Self> {
-        Self::not_implemented("matmul")
+        super::ops::matmul::matmul(self, rhs, bmnk, lhs_layout, rhs_layout)
     }
 
     fn copy_strided_src(&self, _: &mut Self, _: usize, _: &Layout) -> Result<()> {
