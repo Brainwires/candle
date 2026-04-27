@@ -424,6 +424,15 @@ impl candle::CustomOp1 for SoftmaxLastDim {
             candle::MetalStorage::new(output, device.clone(), elem_count, storage.dtype());
         Ok((newstorage, layout.shape().clone()))
     }
+
+    #[cfg(feature = "wgpu")]
+    fn wgpu_fwd(
+        &self,
+        storage: &candle::WgpuStorage,
+        layout: &Layout,
+    ) -> Result<(candle::WgpuStorage, Shape)> {
+        candle::wgpu_backend::ops::softmax::softmax_last_dim(storage, layout)
+    }
 }
 
 pub fn softmax_last_dim(xs: &Tensor) -> Result<Tensor> {
