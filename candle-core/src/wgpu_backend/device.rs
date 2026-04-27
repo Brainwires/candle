@@ -23,7 +23,8 @@
 
 use crate::backend::{BackendDevice, BackendStorage};
 use crate::{CpuStorage, DType, Result, Shape};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use super::storage::WgpuStorage;
 
@@ -39,6 +40,14 @@ pub(crate) struct WgpuDeviceInner {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
     pub(crate) adapter_info: wgpu::AdapterInfo,
+    /// Compute pipelines compiled lazily and cached by a stable key.
+    /// Keys are kernel-name + dtype strings (e.g. `"matmul:f32"`); see
+    /// `wgpu_backend::ops` for the compilation paths.
+    pub(crate) pipelines: Mutex<HashMap<&'static str, Arc<wgpu::ComputePipeline>>>,
+    /// Whether the underlying adapter advertises `Features::SHADER_F16`.
+    /// Kernels that need f16 storage / accumulation check this before
+    /// dispatching.
+    pub(crate) supports_shader_f16: bool,
 }
 
 impl std::fmt::Debug for WgpuDevice {
@@ -91,11 +100,34 @@ impl WgpuDevice {
 
         let adapter_info = adapter.get_info();
 
+        // Negotiate SHADER_F16 if the adapter supports it. Many software
+        // renderers (lavapipe in CI, llvmpipe under Mesa) don't advertise
+        // the feature; we degrade gracefully by leaving the f16 matmul
+        // path returning `not_implemented` rather than failing at device
+        // creation. Higher-level code can fall back to an f32-promoted
+        // path or pick a different backend.
+        let supports_shader_f16 = adapter.features().contains(wgpu::Features::SHADER_F16);
+        let mut required_features = wgpu::Features::empty();
+        if supports_shader_f16 {
+            required_features |= wgpu::Features::SHADER_F16;
+        } else {
+            // One-line warning so the user knows which path is gated.
+            // Don't spam: only emit when the env var is set, otherwise
+            // staying quiet matches the rest of candle's logging style.
+            if std::env::var("CANDLE_WGPU_LOG").is_ok() {
+                eprintln!(
+                    "wgpu: adapter {:?} does not advertise SHADER_F16; \
+                     f16 matmul will fall back to not_implemented",
+                    adapter_info.name
+                );
+            }
+        }
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("brainwires-candle-wgpu-device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     // Default limits work for everything in Phase 3.2 +
                     // typical Gemma-class models. Phase 3.7 may opt into
                     // a higher buffer / bind-group budget if needed.
@@ -111,6 +143,8 @@ impl WgpuDevice {
                 device,
                 queue,
                 adapter_info,
+                pipelines: Mutex::new(HashMap::new()),
+                supports_shader_f16,
             }),
         })
     }
@@ -133,6 +167,61 @@ impl WgpuDevice {
     /// Borrow the underlying `wgpu::Queue`.
     pub(crate) fn queue(&self) -> &wgpu::Queue {
         &self.inner.queue
+    }
+
+    /// `true` when the underlying adapter supports the `SHADER_F16`
+    /// feature and the device was created with it enabled. Kernels that
+    /// require native f16 must check this before compiling.
+    pub(crate) fn supports_shader_f16(&self) -> bool {
+        self.inner.supports_shader_f16
+    }
+
+    /// Get-or-create a compute pipeline keyed by a stable `&'static str`.
+    ///
+    /// Compiling WGSL is moderately expensive (tens to hundreds of
+    /// milliseconds the first time). Subsequent calls reuse the cached
+    /// pipeline. The mutex is held only for the duration of the cache
+    /// lookup / insertion — pipeline compilation itself happens *before*
+    /// the lock is taken so concurrent first-time callers don't serialize
+    /// on each other... but in practice today candle-core is mostly
+    /// single-threaded at the op-dispatch layer, so the lock contention
+    /// story doesn't matter much.
+    pub(crate) fn get_or_create_pipeline(
+        &self,
+        key: &'static str,
+        wgsl_source: &str,
+        entry_point: &str,
+    ) -> Arc<wgpu::ComputePipeline> {
+        // Fast path: pipeline already cached.
+        if let Some(p) = self.inner.pipelines.lock().unwrap().get(key) {
+            return Arc::clone(p);
+        }
+        // Slow path: compile + insert. The lock is dropped during
+        // compilation so concurrent first-time callers don't serialize
+        // unnecessarily — at the cost of possibly compiling the same
+        // shader twice on a true race. The wins outweigh the duplication
+        // since matmul is a hot dispatch.
+        let module = self
+            .inner
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(key),
+                source: wgpu::ShaderSource::Wgsl(wgsl_source.into()),
+            });
+        let pipeline =
+            self.inner
+                .device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some(key),
+                    layout: None,
+                    module: &module,
+                    entry_point,
+                    compilation_options: Default::default(),
+                });
+        let pipeline = Arc::new(pipeline);
+        let mut guard = self.inner.pipelines.lock().unwrap();
+        // Race-safe: another thread may have inserted while we compiled.
+        Arc::clone(guard.entry(key).or_insert(pipeline))
     }
 }
 
