@@ -130,6 +130,10 @@ fn from_raw_data<T: super::GgmlType + Send + Sync + 'static>(
         Device::Cpu => QStorage::Cpu(Box::new(data.to_vec())),
         Device::Metal(metal) => super::metal::load_quantized(metal, data)?,
         Device::Cuda(cuda) => super::cuda::load_quantized(cuda, data)?,
+        #[cfg(feature = "wgpu")]
+        Device::Wgpu(_) => {
+            crate::bail!("wgpu: ggml quantized loading not yet implemented (Phase 3.2+)")
+        }
     };
     super::QTensor::new(data, dims)
 }

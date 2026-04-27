@@ -1,6 +1,8 @@
 use crate::backend::BackendStorage;
 use crate::op::{self, CmpOp, ReduceOp};
 use crate::scalar::Scalar;
+#[cfg(feature = "wgpu")]
+use crate::WgpuStorage;
 use crate::{CpuStorage, CudaStorage, DType, Device, Error, Layout, MetalStorage, Result, Shape};
 use crate::{CustomOp1, CustomOp2, CustomOp3, InplaceOp1, InplaceOp2, InplaceOp3};
 
@@ -11,6 +13,8 @@ pub enum Storage {
     Cpu(CpuStorage),
     Cuda(CudaStorage),
     Metal(MetalStorage),
+    #[cfg(feature = "wgpu")]
+    Wgpu(WgpuStorage),
 }
 
 impl Storage {
@@ -25,6 +29,11 @@ impl Storage {
                 let storage = storage.try_clone(layout)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.try_clone(layout)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -33,6 +42,8 @@ impl Storage {
             Self::Cpu(_) => Device::Cpu,
             Self::Cuda(storage) => Device::Cuda(storage.device().clone()),
             Self::Metal(storage) => Device::Metal(storage.device().clone()),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => Device::Wgpu(storage.device().clone()),
         }
     }
 
@@ -41,6 +52,8 @@ impl Storage {
             Self::Cpu(storage) => storage.dtype(),
             Self::Cuda(storage) => storage.dtype(),
             Self::Metal(storage) => storage.dtype(),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => storage.dtype(),
         }
     }
 
@@ -79,6 +92,8 @@ impl Storage {
             Storage::Cpu(storage) => storage.const_set(v, l),
             Storage::Cuda(storage) => storage.const_set(v, l),
             Storage::Metal(storage) => storage.const_set(v, l),
+            #[cfg(feature = "wgpu")]
+            Storage::Wgpu(storage) => storage.const_set(v, l),
         }
     }
 
@@ -95,6 +110,11 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.affine(layout, mul, add)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.affine(layout, mul, add)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -113,6 +133,11 @@ impl Storage {
                 let storage = storage.powf(layout, alpha)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.powf(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -129,6 +154,11 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.elu(layout, alpha)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.elu(layout, alpha)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -182,6 +212,11 @@ impl Storage {
                 let storage = storage.reduce_op(op, layout, s)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.reduce_op(op, layout, s)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -198,6 +233,11 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.to_dtype(layout, dtype)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.to_dtype(layout, dtype)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -216,6 +256,10 @@ impl Storage {
                 let (storage, shape) = c.metal_fwd(storage, l)?;
                 Ok((Self::Metal(storage), shape))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => Err(Error::Msg(
+                "wgpu: CustomOp1 forward not yet implemented (Phase 3.2+)".into(),
+            )),
         }
     }
 
@@ -277,6 +321,10 @@ impl Storage {
             Self::Cpu(storage) => c.cpu_fwd(storage, l),
             Self::Cuda(storage) => c.cuda_fwd(storage, l),
             Self::Metal(storage) => c.metal_fwd(storage, l),
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(_) => Err(Error::Msg(
+                "wgpu: InplaceOp1 not yet implemented (Phase 3.2+)".into(),
+            )),
         }
     }
 
@@ -330,6 +378,11 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.unary_impl::<B>(layout)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.unary_impl::<B>(layout)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -511,6 +564,11 @@ impl Storage {
                 let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.avg_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -533,6 +591,11 @@ impl Storage {
                 let storage = storage.max_pool2d(layout, kernel_size, stride)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.max_pool2d(layout, kernel_size, stride)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -550,6 +613,11 @@ impl Storage {
                 let storage = storage.upsample_nearest1d(layout, sz)?;
                 Ok(Self::Metal(storage))
             }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest1d(layout, sz)?;
+                Ok(Self::Wgpu(storage))
+            }
         }
     }
 
@@ -566,6 +634,11 @@ impl Storage {
             Self::Metal(storage) => {
                 let storage = storage.upsample_nearest2d(layout, h, w)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage = storage.upsample_nearest2d(layout, h, w)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }
@@ -594,6 +667,12 @@ impl Storage {
                 let storage =
                     storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
                 Ok(Self::Metal(storage))
+            }
+            #[cfg(feature = "wgpu")]
+            Self::Wgpu(storage) => {
+                let storage =
+                    storage.upsample_bilinear2d(layout, h, w, align_corners, scale_h, scale_w)?;
+                Ok(Self::Wgpu(storage))
             }
         }
     }

@@ -87,6 +87,8 @@ mod tensor_cat;
 pub mod test_utils;
 pub mod utils;
 mod variable;
+#[cfg(feature = "wgpu")]
+pub mod wgpu_backend;
 
 #[cfg(feature = "cudnn")]
 pub use cuda_backend::cudnn;
@@ -121,6 +123,9 @@ pub use metal_backend::{MetalDevice, MetalError, MetalStorage};
 
 #[cfg(not(feature = "metal"))]
 pub use dummy_metal_backend::{MetalDevice, MetalError, MetalStorage};
+
+#[cfg(feature = "wgpu")]
+pub use wgpu_backend::{WgpuDevice, WgpuStorage};
 
 #[cfg(feature = "mkl")]
 extern crate intel_mkl_src;
