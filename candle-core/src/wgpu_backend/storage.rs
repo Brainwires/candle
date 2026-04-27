@@ -521,8 +521,8 @@ impl BackendStorage for WgpuStorage {
         Self::not_implemented("scatter_add_set")
     }
 
-    fn index_select(&self, _: &Self, _: &Layout, _: &Layout, _: usize) -> Result<Self> {
-        Self::not_implemented("index_select")
+    fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        super::ops::index_select::index_select(self, ids, src_l, ids_l, dim)
     }
 
     fn index_add(
