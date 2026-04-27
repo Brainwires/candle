@@ -2391,6 +2391,16 @@ impl Tensor {
                     let dst_storage = storage.transfer_to_device(cuda)?;
                     Storage::Cuda(dst_storage)
                 }
+                #[cfg(feature = "wgpu")]
+                (Storage::Cpu(storage), Device::Wgpu(wgpu_dev)) => {
+                    use crate::backend::BackendDevice;
+                    Storage::Wgpu(wgpu_dev.storage_from_cpu_storage(storage)?)
+                }
+                #[cfg(feature = "wgpu")]
+                (Storage::Wgpu(storage), Device::Cpu) => {
+                    use crate::backend::BackendStorage;
+                    Storage::Cpu(storage.to_cpu_storage()?)
+                }
                 (Storage::Cpu(storage), Device::Cpu) => Storage::Cpu(storage.clone()),
                 _ => {
                     bail!(
