@@ -37,10 +37,7 @@ fn render_wgsl() -> String {
     TEMPLATE.replace("__SCALAR_T__", "f32")
 }
 
-pub fn softmax_last_dim(
-    src: &WgpuStorage,
-    layout: &Layout,
-) -> Result<(WgpuStorage, Shape)> {
+pub fn softmax_last_dim(src: &WgpuStorage, layout: &Layout) -> Result<(WgpuStorage, Shape)> {
     let device = &src.device;
 
     if src.dtype != DType::F32 {
@@ -152,11 +149,7 @@ pub fn softmax_last_dim(
     }
     device.queue().submit(Some(encoder.finish()));
 
-    let out = WgpuStorage::from_raw_buffer(
-        Arc::new(out_buffer),
-        n_elements,
-        DType::F32,
-        device.clone(),
-    );
+    let out =
+        WgpuStorage::from_raw_buffer(Arc::new(out_buffer), n_elements, DType::F32, device.clone());
     Ok((out, layout.shape().clone()))
 }

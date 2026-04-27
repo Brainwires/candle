@@ -58,7 +58,6 @@ pub(crate) fn to_dtype(
     let device = &src.device;
     let src_dtype = src.dtype;
 
-
     if !layout.is_contiguous() {
         return Err(crate::Error::Msg(
             "wgpu: to_dtype requires contiguous source".to_string(),
@@ -92,9 +91,12 @@ pub(crate) fn to_dtype(
         (DType::I32, DType::F32) => "cast:i32:f32",
         (DType::F32, DType::U32) => "cast:f32:u32",
         (DType::F32, DType::I32) => "cast:f32:i32",
-        _ => return Err(crate::Error::Msg(format!(
-            "wgpu: cast from {:?} to {:?} not implemented", src_dtype, dst_dtype
-        ))),
+        _ => {
+            return Err(crate::Error::Msg(format!(
+                "wgpu: cast from {:?} to {:?} not implemented",
+                src_dtype, dst_dtype
+            )))
+        }
     };
     let wgsl = render_wgsl(src_wgsl, dst_wgsl);
     let pipeline = device.get_or_create_pipeline(&pipeline_key, &wgsl, "main");

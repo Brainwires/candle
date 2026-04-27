@@ -82,7 +82,9 @@ fn build_weight_map(cfg: &gemma3::Config, device: &Device) -> HashMap<String, Te
 
     // Embedding.
     let seed_val = |n: usize| -> Vec<f32> {
-        (0..n).map(|i| ((i as f32) * 0.00123 + 0.01).sin() * 0.1).collect()
+        (0..n)
+            .map(|i| ((i as f32) * 0.00123 + 0.01).sin() * 0.1)
+            .collect()
     };
 
     let add = |map: &mut HashMap<String, Tensor>, name: &str, shape: &[usize]| {
@@ -104,25 +106,69 @@ fn build_weight_map(cfg: &gemma3::Config, device: &Device) -> HashMap<String, Te
         let prefix = format!("model.layers.{layer_idx}");
 
         // Attention projections.
-        add(&mut map, &format!("{prefix}.self_attn.q_proj.weight"), &[nh * hd, hs]);
-        add(&mut map, &format!("{prefix}.self_attn.k_proj.weight"), &[nkv * hd, hs]);
-        add(&mut map, &format!("{prefix}.self_attn.v_proj.weight"), &[nkv * hd, hs]);
-        add(&mut map, &format!("{prefix}.self_attn.o_proj.weight"), &[hs, nh * hd]);
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.q_proj.weight"),
+            &[nh * hd, hs],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.k_proj.weight"),
+            &[nkv * hd, hs],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.v_proj.weight"),
+            &[nkv * hd, hs],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.o_proj.weight"),
+            &[hs, nh * hd],
+        );
 
         // QK norms.
-        add(&mut map, &format!("{prefix}.self_attn.q_norm.weight"), &[hd]);
-        add(&mut map, &format!("{prefix}.self_attn.k_norm.weight"), &[hd]);
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            &[hd],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.self_attn.k_norm.weight"),
+            &[hd],
+        );
 
         // MLP.
-        add(&mut map, &format!("{prefix}.mlp.gate_proj.weight"), &[is, hs]);
+        add(
+            &mut map,
+            &format!("{prefix}.mlp.gate_proj.weight"),
+            &[is, hs],
+        );
         add(&mut map, &format!("{prefix}.mlp.up_proj.weight"), &[is, hs]);
-        add(&mut map, &format!("{prefix}.mlp.down_proj.weight"), &[hs, is]);
+        add(
+            &mut map,
+            &format!("{prefix}.mlp.down_proj.weight"),
+            &[hs, is],
+        );
 
         // Layer norms.
         add(&mut map, &format!("{prefix}.input_layernorm.weight"), &[hs]);
-        add(&mut map, &format!("{prefix}.pre_feedforward_layernorm.weight"), &[hs]);
-        add(&mut map, &format!("{prefix}.post_feedforward_layernorm.weight"), &[hs]);
-        add(&mut map, &format!("{prefix}.post_attention_layernorm.weight"), &[hs]);
+        add(
+            &mut map,
+            &format!("{prefix}.pre_feedforward_layernorm.weight"),
+            &[hs],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.post_feedforward_layernorm.weight"),
+            &[hs],
+        );
+        add(
+            &mut map,
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[hs],
+        );
     }
 
     map
@@ -207,10 +253,22 @@ fn gemma_tiny_e2e() {
     let cpu_flat: Vec<f32> = logits_cpu.flatten_all().unwrap().to_vec1().unwrap();
     let gpu_flat: Vec<f32> = logits_gpu.flatten_all().unwrap().to_vec1().unwrap();
 
-    eprintln!("[gemma_tiny_e2e] CPU logits shape: {:?}", logits_cpu.shape());
-    eprintln!("[gemma_tiny_e2e] GPU logits shape: {:?}", logits_gpu.shape());
-    eprintln!("[gemma_tiny_e2e] CPU logits (first 8): {:?}", &cpu_flat[..cpu_flat.len().min(8)]);
-    eprintln!("[gemma_tiny_e2e] GPU logits (first 8): {:?}", &gpu_flat[..gpu_flat.len().min(8)]);
+    eprintln!(
+        "[gemma_tiny_e2e] CPU logits shape: {:?}",
+        logits_cpu.shape()
+    );
+    eprintln!(
+        "[gemma_tiny_e2e] GPU logits shape: {:?}",
+        logits_gpu.shape()
+    );
+    eprintln!(
+        "[gemma_tiny_e2e] CPU logits (first 8): {:?}",
+        &cpu_flat[..cpu_flat.len().min(8)]
+    );
+    eprintln!(
+        "[gemma_tiny_e2e] GPU logits (first 8): {:?}",
+        &gpu_flat[..gpu_flat.len().min(8)]
+    );
 
     let diff = assert_close(&cpu_flat, &gpu_flat, 1e-2, "gemma_tiny_e2e");
     eprintln!("[gemma_tiny_e2e] max diff = {diff}");

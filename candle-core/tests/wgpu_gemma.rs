@@ -102,7 +102,9 @@ fn index_select_large_embedding() {
     let src_data: Vec<f32> = (0..(vocab * hidden))
         .map(|i| ((i as f32) * 0.001).sin())
         .collect();
-    let ids_data: Vec<u32> = (0..seq_len).map(|i| ((i * 17 + 3) % vocab) as u32).collect();
+    let ids_data: Vec<u32> = (0..seq_len)
+        .map(|i| ((i * 17 + 3) % vocab) as u32)
+        .collect();
 
     let src_cpu = Tensor::from_slice(&src_data, (vocab, hidden), &cpu).unwrap();
     let ids_cpu = Tensor::from_slice(&ids_data, (seq_len,), &cpu).unwrap();
