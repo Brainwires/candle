@@ -85,6 +85,10 @@ impl PyDevice {
             Device::Cpu => Self::Cpu,
             Device::Cuda(_) => Self::Cuda,
             Device::Metal(_) => Self::Metal,
+            // wgpu is feature-gated in candle-core; surface it as Cpu in
+            // the Python binding for now (Phase 3.1 has no real device).
+            #[cfg(feature = "wgpu")]
+            Device::Wgpu(_) => Self::Cpu,
         }
     }
 
