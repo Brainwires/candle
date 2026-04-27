@@ -408,12 +408,17 @@ impl BackendStorage for WgpuStorage {
         Self::not_implemented("to_dtype")
     }
 
-    fn unary_impl<B: UnaryOpT>(&self, _: &Layout) -> Result<Self> {
-        Self::not_implemented("unary_impl")
+    fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        super::ops::unary::unary::<B>(self, layout)
     }
 
-    fn binary_impl<B: BinaryOpT>(&self, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
-        Self::not_implemented("binary_impl")
+    fn binary_impl<B: BinaryOpT>(
+        &self,
+        rhs: &Self,
+        lhs_layout: &Layout,
+        rhs_layout: &Layout,
+    ) -> Result<Self> {
+        super::ops::binary::binary::<B>(self, rhs, lhs_layout, rhs_layout)
     }
 
     fn where_cond(&self, _: &Layout, _: &Self, _: &Layout, _: &Self, _: &Layout) -> Result<Self> {

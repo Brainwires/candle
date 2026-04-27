@@ -5,4 +5,6 @@
 //! geometry, and shape/stride uniform packing. Phase 3.3 ships `matmul`;
 //! Phases 3.4+ add elementwise / reductions / attention ops alongside.
 
+pub(crate) mod binary;
 pub(crate) mod matmul;
+pub(crate) mod unary;
