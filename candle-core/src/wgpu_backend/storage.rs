@@ -384,8 +384,8 @@ impl BackendStorage for WgpuStorage {
         self.read_to_cpu()
     }
 
-    fn affine(&self, _: &Layout, _: f64, _: f64) -> Result<Self> {
-        Self::not_implemented("affine")
+    fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        super::ops::affine::affine(self, layout, mul, add)
     }
 
     fn powf(&self, _: &Layout, _: f64) -> Result<Self> {
@@ -396,8 +396,8 @@ impl BackendStorage for WgpuStorage {
         Self::not_implemented("elu")
     }
 
-    fn reduce_op(&self, _: ReduceOp, _: &Layout, _: &[usize]) -> Result<Self> {
-        Self::not_implemented("reduce_op")
+    fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        super::ops::reduce::reduce_op(self, op, layout, reduce_dims)
     }
 
     fn cmp(&self, _: CmpOp, _: &Self, _: &Layout, _: &Layout) -> Result<Self> {
