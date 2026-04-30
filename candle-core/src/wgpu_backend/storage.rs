@@ -168,7 +168,7 @@ impl WgpuStorage {
         });
         {
             let mut view = buffer.slice(..).get_mapped_range_mut();
-            view.fill(0);
+            view.slice(..).fill(0);
         }
         buffer.unmap();
 
@@ -213,11 +213,8 @@ impl WgpuStorage {
         });
         {
             let mut view = buffer.slice(..).get_mapped_range_mut();
-            view[..bytes.len()].copy_from_slice(&bytes);
-            // Zero any trailing alignment padding.
-            for b in view[bytes.len()..].iter_mut() {
-                *b = 0;
-            }
+            view.slice(..bytes.len()).copy_from_slice(&bytes);
+            view.slice(bytes.len()..).fill(0);
         }
         buffer.unmap();
 
@@ -293,7 +290,7 @@ impl WgpuStorage {
         // ride the async story we wire up in Phase 3.8.
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let _ = self.device.device().poll(wgpu::Maintain::Wait);
+            self.device.device().poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok();
             let map_result = rx
                 .recv()
                 .map_err(|e| crate::Error::Msg(format!("wgpu: map channel closed: {e}")))?;

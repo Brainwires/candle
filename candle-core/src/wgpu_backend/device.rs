@@ -83,7 +83,7 @@ impl WgpuDevice {
     /// and requests a default device. No surface is required because we
     /// only use the compute pipeline.
     pub async fn new_async() -> Result<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
@@ -91,12 +91,7 @@ impl WgpuDevice {
                 compatible_surface: None,
             })
             .await
-            .ok_or_else(|| {
-                crate::Error::Msg(
-                    "wgpu: no suitable GPU adapter found (no Vulkan/Metal/DX12/WebGPU available)"
-                        .to_string(),
-                )
-            })?;
+            .map_err(|e| crate::Error::Msg(format!("wgpu: no suitable GPU adapter found: {e}")))?;
 
         let adapter_info = adapter.get_info();
 
@@ -128,12 +123,11 @@ impl WgpuDevice {
                 &wgpu::DeviceDescriptor {
                     label: Some("brainwires-candle-wgpu-device"),
                     required_features,
-                    // Default limits work for everything in Phase 3.2 +
-                    // typical Gemma-class models. Phase 3.7 may opt into
-                    // a higher buffer / bind-group budget if needed.
                     required_limits: wgpu::Limits::default(),
+                    experimental_features: Default::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                    trace: Default::default(),
                 },
-                None,
             )
             .await
             .map_err(|e| crate::Error::Msg(format!("wgpu: request_device failed: {e}")))?;
@@ -215,8 +209,9 @@ impl WgpuDevice {
                     label: Some(key),
                     layout: None,
                     module: &module,
-                    entry_point,
+                    entry_point: Some(entry_point),
                     compilation_options: Default::default(),
+                    cache: None,
                 });
         let pipeline = Arc::new(pipeline);
         let mut guard = self.inner.pipelines.lock().unwrap();
@@ -312,7 +307,7 @@ impl BackendDevice for WgpuDevice {
         // `Maintain::Wait` blocks until the GPU has finished all queued
         // work. On wasm32 `device.poll` is a no-op (browsers schedule
         // this themselves) — that matches WebGPU semantics.
-        let _ = self.inner.device.poll(wgpu::Maintain::Wait);
+        self.inner.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).ok();
         Ok(())
     }
 }
