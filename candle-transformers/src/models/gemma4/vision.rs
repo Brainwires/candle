@@ -387,7 +387,12 @@ impl VisionPooler {
         let (b, num_patches, dim) = x.dims3()?;
         let k = ((num_patches as f64 / output_length as f64).sqrt()) as i64;
         let k_sq = k * k;
-        let device = x.device();
+        let original_device = x.device().clone();
+
+        // scatter_add is not implemented on every backend (e.g. WebGPU).
+        // Run the pooling math on CPU and transfer the result back.
+        let x = x.to_device(&Device::Cpu)?;
+        let patch_positions = patch_positions.to_device(&Device::Cpu)?;
 
         let clamped = patch_positions.clamp(0i64, i64::MAX)?;
         let pos_x = clamped.i((.., .., 0usize))?.to_dtype(DType::F32)?;
@@ -407,12 +412,12 @@ impl VisionPooler {
             .unsqueeze(2)?
             .broadcast_as(&[b, num_patches, dim])?
             .contiguous()?;
-        let output = Tensor::zeros((b, output_length, dim), DType::F32, device)?
+        let output = Tensor::zeros((b, output_length, dim), DType::F32, &Device::Cpu)?
             .scatter_add(&idx_expanded, &x_scaled, 1)?
             .to_dtype(original_dtype)?;
 
-        // Scale by sqrt(hidden_size)
-        output * (self.hidden_size as f64).sqrt()
+        // Scale by sqrt(hidden_size) and move back to the original device.
+        (output * (self.hidden_size as f64).sqrt())?.to_device(&original_device)
     }
 
     fn forward(

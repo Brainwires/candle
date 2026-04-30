@@ -636,6 +636,42 @@ impl TextModel {
         }
     }
 
+    /// Forward pass through decoder layers + final norm only, returning
+    /// hidden states *before* the lm_head projection. Used for mixed-device
+    /// execution where embed_tokens / lm_head live on CPU while the decoder
+    /// layers run on GPU.
+    pub fn forward_embeds_hidden(
+        &mut self,
+        xs: &Tensor,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
+        let (attention_mask, sliding_attention_mask) =
+            self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
+
+        let mut xs = xs.clone();
+        for layer in self.layers.iter_mut() {
+            xs = layer.forward(
+                &xs,
+                attention_mask.as_ref(),
+                sliding_attention_mask.as_ref(),
+                seqlen_offset,
+            )?
+        }
+        xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
+    }
+
+    /// Project hidden states to logits via the lm_head linear layer.
+    /// Applies final logit softcapping if configured.
+    pub fn lm_head(&self, hidden: &Tensor) -> Result<Tensor> {
+        let logits = hidden.apply(&self.lm_head)?;
+        match self.final_logit_softcapping {
+            None => Ok(logits),
+            Some(sc) => Ok(((logits / sc)?.tanh()? * sc)?),
+        }
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
