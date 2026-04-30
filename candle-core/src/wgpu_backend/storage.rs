@@ -226,10 +226,12 @@ impl WgpuStorage {
         })
     }
 
-    /// Wrap an existing `wgpu::Buffer` produced by a compute kernel as
-    /// a `WgpuStorage`. Used by ops modules (`super::ops`) when they
-    /// allocate output buffers themselves.
-    pub(crate) fn from_raw_buffer(
+    /// Wrap an existing `wgpu::Buffer` as a `WgpuStorage`.
+    ///
+    /// The caller is responsible for ensuring the buffer contains valid
+    /// data for `len` elements of `dtype`. Used internally by ops modules
+    /// and externally for streamed uploads that bypass WASM linear memory.
+    pub fn from_raw_buffer(
         buffer: Arc<wgpu::Buffer>,
         len: usize,
         dtype: DType,

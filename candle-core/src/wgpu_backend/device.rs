@@ -170,6 +170,28 @@ impl WgpuDevice {
         self.inner.supports_shader_f16
     }
 
+    /// Create a GPU buffer suitable for storage (STORAGE | COPY_SRC |
+    /// COPY_DST). Use with [`Self::write_to_buffer`] for streamed uploads
+    /// that bypass WASM linear memory.
+    pub fn create_storage_buffer(&self, size: u64) -> wgpu::Buffer {
+        let align = wgpu::COPY_BUFFER_ALIGNMENT;
+        let aligned = size.div_ceil(align) * align;
+        self.inner.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu-storage-streamed"),
+            size: aligned.max(align),
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Write `data` into `buffer` at the given byte offset via the GPU
+    /// queue. Used for chunked uploads of large tensors.
+    pub fn write_to_buffer(&self, buffer: &wgpu::Buffer, offset: u64, data: &[u8]) {
+        self.inner.queue.write_buffer(buffer, offset, data);
+    }
+
     /// Get-or-create a compute pipeline keyed by a stable `&'static str`.
     ///
     /// Compiling WGSL is moderately expensive (tens to hundreds of
