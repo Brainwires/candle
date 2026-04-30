@@ -20,40 +20,74 @@ pub use audio::AudioModel;
 pub use config::{Gemma4AudioConfig, Gemma4TextConfig, Gemma4VisionConfig};
 
 /// Full Gemma4 multimodal model.
+///
+/// `vision_tower` / `embed_vision` and `audio_tower` / `embed_audio` are
+/// `Option`s so callers (e.g. wasm) can defer loading those weights and
+/// attach them later via [`Model::attach_vision`] / [`Model::attach_audio`].
 pub struct Model {
     pub language_model: TextModel,
-    pub vision_tower: VisionTower,
-    pub embed_vision: MultimodalEmbedder,
+    pub vision_tower: Option<VisionTower>,
+    pub embed_vision: Option<MultimodalEmbedder>,
     pub audio_tower: Option<AudioModel>,
     pub embed_audio: Option<MultimodalEmbedder>,
     pub cfg: Gemma4Config,
 }
 
 impl Model {
+    /// Construct the full model: text + vision (always) + audio (if configured).
+    /// Equivalent to [`Model::new_partial(cfg, vb, true, cfg.audio_config.is_some())`].
     pub fn new(cfg: &Gemma4Config, vb: candle_nn::VarBuilder) -> Result<Self> {
+        Self::new_partial(cfg, vb, true, cfg.audio_config.is_some())
+    }
+
+    /// Construct a text-only model. Vision and audio towers are unloaded;
+    /// attach them later with [`Model::attach_vision`] / [`Model::attach_audio`].
+    pub fn new_text_only(cfg: &Gemma4Config, vb: candle_nn::VarBuilder) -> Result<Self> {
+        Self::new_partial(cfg, vb, false, false)
+    }
+
+    /// Selective constructor.
+    ///
+    /// `with_vision`: build [`VisionTower`] + vision [`MultimodalEmbedder`].
+    /// `with_audio`: build [`AudioModel`] + audio [`MultimodalEmbedder`]
+    /// (no-op if `cfg.audio_config` is `None`).
+    pub fn new_partial(
+        cfg: &Gemma4Config,
+        vb: candle_nn::VarBuilder,
+        with_vision: bool,
+        with_audio: bool,
+    ) -> Result<Self> {
         let vb = vb.pp("model");
 
-        let vision_tower = VisionTower::new(&cfg.vision_config, vb.pp("vision_tower"))?;
-
-        let vis_hidden = cfg.vision_config.hidden_size;
         let text_hidden = cfg.text_config.hidden_size;
-        let embed_vision = MultimodalEmbedder::new(
-            vis_hidden,
-            text_hidden,
-            cfg.vision_config.rms_norm_eps,
-            vb.pp("embed_vision"),
-        )?;
 
-        let (audio_tower, embed_audio) = if let Some(ref audio_cfg) = cfg.audio_config {
-            let tower = AudioModel::new(audio_cfg, vb.pp("audio_tower"))?;
-            let audio_hidden = audio_cfg.output_proj_dims.unwrap_or(audio_cfg.hidden_size);
-            let embed = MultimodalEmbedder::new(
-                audio_hidden,
+        let (vision_tower, embed_vision) = if with_vision {
+            let vt = VisionTower::new(&cfg.vision_config, vb.pp("vision_tower"))?;
+            let ev = MultimodalEmbedder::new(
+                cfg.vision_config.hidden_size,
                 text_hidden,
-                audio_cfg.rms_norm_eps,
-                vb.pp("embed_audio"),
+                cfg.vision_config.rms_norm_eps,
+                vb.pp("embed_vision"),
             )?;
-            (Some(tower), Some(embed))
+            (Some(vt), Some(ev))
+        } else {
+            (None, None)
+        };
+
+        let (audio_tower, embed_audio) = if with_audio {
+            if let Some(ref audio_cfg) = cfg.audio_config {
+                let tower = AudioModel::new(audio_cfg, vb.pp("audio_tower"))?;
+                let audio_hidden = audio_cfg.output_proj_dims.unwrap_or(audio_cfg.hidden_size);
+                let embed = MultimodalEmbedder::new(
+                    audio_hidden,
+                    text_hidden,
+                    audio_cfg.rms_norm_eps,
+                    vb.pp("embed_audio"),
+                )?;
+                (Some(tower), Some(embed))
+            } else {
+                (None, None)
+            }
         } else {
             (None, None)
         };
@@ -68,6 +102,53 @@ impl Model {
             embed_audio,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Load the vision tower + vision embedder into an existing model.
+    /// `vb` should be the same VarBuilder root used at construction (the one
+    /// that gets `.pp("model")` applied internally).
+    pub fn attach_vision(&mut self, vb: candle_nn::VarBuilder) -> Result<()> {
+        let vb = vb.pp("model");
+        let vt = VisionTower::new(&self.cfg.vision_config, vb.pp("vision_tower"))?;
+        let ev = MultimodalEmbedder::new(
+            self.cfg.vision_config.hidden_size,
+            self.cfg.text_config.hidden_size,
+            self.cfg.vision_config.rms_norm_eps,
+            vb.pp("embed_vision"),
+        )?;
+        self.vision_tower = Some(vt);
+        self.embed_vision = Some(ev);
+        Ok(())
+    }
+
+    /// Load the audio tower + audio embedder into an existing model.
+    /// Errors if `cfg.audio_config` is `None`.
+    pub fn attach_audio(&mut self, vb: candle_nn::VarBuilder) -> Result<()> {
+        let vb = vb.pp("model");
+        let audio_cfg = self
+            .cfg
+            .audio_config
+            .as_ref()
+            .ok_or_else(|| candle::Error::Msg("attach_audio: cfg.audio_config is None".into()))?;
+        let tower = AudioModel::new(audio_cfg, vb.pp("audio_tower"))?;
+        let audio_hidden = audio_cfg.output_proj_dims.unwrap_or(audio_cfg.hidden_size);
+        let embed = MultimodalEmbedder::new(
+            audio_hidden,
+            self.cfg.text_config.hidden_size,
+            audio_cfg.rms_norm_eps,
+            vb.pp("embed_audio"),
+        )?;
+        self.audio_tower = Some(tower);
+        self.embed_audio = Some(embed);
+        Ok(())
+    }
+
+    pub fn has_vision(&self) -> bool {
+        self.vision_tower.is_some() && self.embed_vision.is_some()
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.audio_tower.is_some() && self.embed_audio.is_some()
     }
 
     /// Text-only forward pass.
@@ -98,13 +179,25 @@ impl Model {
 
         // ── Vision embedding injection ──────────────────────────────────
         if let Some(pixel_values) = pixel_values {
+            let vision_tower = self
+                .vision_tower
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg(
+                    "forward_multimodal: pixel_values supplied but vision_tower is not attached".into(),
+                ))?;
+            let embed_vision = self
+                .embed_vision
+                .as_ref()
+                .ok_or_else(|| candle::Error::Msg(
+                    "forward_multimodal: pixel_values supplied but embed_vision is not attached".into(),
+                ))?;
+
             let image_mask = input_ids
                 .to_dtype(DType::F32)?
                 .eq(self.cfg.image_token_id as f64)?;
 
-            let vision_features = self.vision_tower.forward(pixel_values)?;
-            let image_embeds = self
-                .embed_vision
+            let vision_features = vision_tower.forward(pixel_values)?;
+            let image_embeds = embed_vision
                 .forward(&vision_features)?
                 .to_dtype(input_embeds.dtype())?;
 
