@@ -12,6 +12,8 @@ use std::sync::Arc;
 use super::super::storage::WgpuStorage;
 
 const TEMPLATE: &str = include_str!("../kernels/cast.wgsl");
+const TEMPLATE_TO_BF16: &str = include_str!("../kernels/cast_to_bf16.wgsl");
+const TEMPLATE_FROM_BF16: &str = include_str!("../kernels/cast_from_bf16.wgsl");
 const WORKGROUP_SIZE: u32 = 64;
 
 #[repr(C)]
@@ -64,9 +66,6 @@ pub(crate) fn to_dtype(
         ));
     }
 
-    let src_wgsl = wgsl_type(src_dtype)?;
-    let dst_wgsl = wgsl_type(dst_dtype)?;
-
     let n_elements = layout.shape().elem_count();
     if n_elements == 0 {
         return WgpuStorage::alloc_zeros(device.clone(), dst_dtype, layout.shape());
@@ -86,11 +85,100 @@ pub(crate) fn to_dtype(
         _pad1: 0,
     };
 
-    let pipeline_key: &'static str = match (src_dtype, dst_dtype) {
-        (DType::U32, DType::F32) => "cast:u32:f32",
-        (DType::I32, DType::F32) => "cast:i32:f32",
-        (DType::F32, DType::U32) => "cast:f32:u32",
-        (DType::F32, DType::I32) => "cast:f32:i32",
+    enum CastKind {
+        Direct { wgsl: String, dispatch: u32 },
+        ToBf16 { wgsl: String, dispatch: u32 },
+        FromBf16 { wgsl: String, dispatch: u32 },
+    }
+
+    // BF16 is packed as `array<u32>` (2 BF16s per u32) and uses dedicated
+    // kernels — WGSL has no native BF16 type. The other dtype pairs use
+    // the simple cast-by-construction template.
+    let (pipeline_key, kind) = match (src_dtype, dst_dtype) {
+        (DType::U32, DType::F32) => (
+            "cast:u32:f32",
+            CastKind::Direct {
+                wgsl: render_wgsl("u32", "f32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::I32, DType::F32) => (
+            "cast:i32:f32",
+            CastKind::Direct {
+                wgsl: render_wgsl("i32", "f32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::F32, DType::U32) => (
+            "cast:f32:u32",
+            CastKind::Direct {
+                wgsl: render_wgsl("f32", "u32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::F32, DType::I32) => (
+            "cast:f32:i32",
+            CastKind::Direct {
+                wgsl: render_wgsl("f32", "i32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        // → BF16: one thread per BF16 *pair*, so dispatch = ceil(n / 2 / WG).
+        (DType::F32, DType::BF16) => (
+            "cast:f32:bf16",
+            CastKind::ToBf16 {
+                wgsl: TEMPLATE_TO_BF16.replace("__SRC_T__", "f32"),
+                dispatch: n_elements_u32.div_ceil(2).div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::U32, DType::BF16) => (
+            "cast:u32:bf16",
+            CastKind::ToBf16 {
+                wgsl: TEMPLATE_TO_BF16.replace("__SRC_T__", "u32"),
+                dispatch: n_elements_u32.div_ceil(2).div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::I32, DType::BF16) => (
+            "cast:i32:bf16",
+            CastKind::ToBf16 {
+                wgsl: TEMPLATE_TO_BF16.replace("__SRC_T__", "i32"),
+                dispatch: n_elements_u32.div_ceil(2).div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        // BF16 →: one thread per BF16 element.
+        (DType::BF16, DType::F32) => (
+            "cast:bf16:f32",
+            CastKind::FromBf16 {
+                wgsl: TEMPLATE_FROM_BF16.replace("__DST_T__", "f32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::BF16, DType::U32) => (
+            "cast:bf16:u32",
+            CastKind::FromBf16 {
+                wgsl: TEMPLATE_FROM_BF16.replace("__DST_T__", "u32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (DType::BF16, DType::I32) => (
+            "cast:bf16:i32",
+            CastKind::FromBf16 {
+                wgsl: TEMPLATE_FROM_BF16.replace("__DST_T__", "i32"),
+                dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+            },
+        ),
+        (a, b) if a == b => {
+            // Same-dtype "cast" is a copy; route through the direct template
+            // to keep one code path.
+            let t = wgsl_type(a)?;
+            (
+                "cast:identity",
+                CastKind::Direct {
+                    wgsl: render_wgsl(t, t),
+                    dispatch: n_elements_u32.div_ceil(WORKGROUP_SIZE),
+                },
+            )
+        }
         _ => {
             return Err(crate::Error::Msg(format!(
                 "wgpu: cast from {:?} to {:?} not implemented",
@@ -98,8 +186,12 @@ pub(crate) fn to_dtype(
             )))
         }
     };
-    let wgsl = render_wgsl(src_wgsl, dst_wgsl);
-    let pipeline = device.get_or_create_pipeline(&pipeline_key, &wgsl, "main");
+    let (wgsl, dispatch_groups) = match &kind {
+        CastKind::Direct { wgsl, dispatch }
+        | CastKind::ToBf16 { wgsl, dispatch }
+        | CastKind::FromBf16 { wgsl, dispatch } => (wgsl.as_str(), *dispatch),
+    };
+    let pipeline = device.get_or_create_pipeline(&pipeline_key, wgsl, "main");
 
     let dst_elem_bytes = dst_dtype.size_in_bytes() as u64;
     let raw_size = (n_elements as u64) * dst_elem_bytes;
@@ -161,8 +253,7 @@ pub(crate) fn to_dtype(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        let groups_x = n_elements_u32.div_ceil(WORKGROUP_SIZE);
-        pass.dispatch_workgroups(groups_x, 1, 1);
+        pass.dispatch_workgroups(dispatch_groups, 1, 1);
     }
     device.queue().submit(Some(encoder.finish()));
 
