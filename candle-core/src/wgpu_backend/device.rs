@@ -118,12 +118,21 @@ impl WgpuDevice {
             }
         }
 
+        // Request the adapter's maximum buffer size so large tensors
+        // (embedding tables, etc.) can be allocated in a single GPU buffer.
+        // The WebGPU default is 256 MB which is too small for LLM weights.
+        let adapter_limits = adapter.limits();
+        let mut required_limits = wgpu::Limits::default();
+        required_limits.max_buffer_size = adapter_limits.max_buffer_size;
+        required_limits.max_storage_buffer_binding_size =
+            adapter_limits.max_storage_buffer_binding_size;
+
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("brainwires-candle-wgpu-device"),
                     required_features,
-                    required_limits: wgpu::Limits::default(),
+                    required_limits,
                     experimental_features: Default::default(),
                     memory_hints: wgpu::MemoryHints::default(),
                     trace: Default::default(),
