@@ -321,6 +321,108 @@ impl WgpuStorage {
         staging.unmap();
         Ok(cpu)
     }
+
+    /// Asynchronous readback. Required path on `wasm32`, where the JS
+    /// event loop drives `map_async` completion and a synchronous
+    /// `recv()` would deadlock the worker. Functionally identical to
+    /// [`Self::read_to_cpu`]; uses a hand-rolled `Future` over the
+    /// `map_async` callback so the wasm-bindgen-futures executor can
+    /// suspend the task while the GPU work and mapping complete.
+    pub async fn read_to_cpu_async(&self) -> Result<CpuStorage> {
+        let elem_bytes = self.dtype.size_in_bytes();
+        if elem_bytes == 0 {
+            return Err(crate::Error::Msg(format!(
+                "wgpu: readback for sub-byte dtype {:?} not yet supported",
+                self.dtype
+            )));
+        }
+        let payload_bytes = (self.len * elem_bytes) as u64;
+        let staging_size = aligned_size(payload_bytes.max(wgpu::COPY_BUFFER_ALIGNMENT));
+
+        let staging = self.device.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wgpu-storage-readback-staging"),
+            size: staging_size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut encoder =
+            self.device
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("wgpu-storage-readback"),
+                });
+        encoder.copy_buffer_to_buffer(&self.buffer, 0, &staging, 0, staging_size);
+        self.device.queue().submit(Some(encoder.finish()));
+
+        let slice = staging.slice(..);
+
+        // Bridge `map_async`'s fire-and-forget callback to a `Future`. The
+        // shared state holds either the result (filled by the callback)
+        // or the executor's waker (filled when we `await` before the
+        // callback fires). Arc<Mutex<…>> works on both wasm32 (no-op)
+        // and native (we may park briefly while `device.poll(Wait)` runs
+        // off-thread before the callback resolves the channel).
+        struct State {
+            result: Option<std::result::Result<(), wgpu::BufferAsyncError>>,
+            waker: Option<std::task::Waker>,
+        }
+        let state = std::sync::Arc::new(std::sync::Mutex::new(State {
+            result: None,
+            waker: None,
+        }));
+        let cb_state = std::sync::Arc::clone(&state);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let mut s = cb_state.lock().unwrap();
+            s.result = Some(result);
+            if let Some(w) = s.waker.take() {
+                w.wake();
+            }
+        });
+
+        // On native we still need to poll the device to drain queued
+        // submissions — the callback won't fire otherwise. `Wait` is
+        // safe here because we're on a thread that's not the JS event
+        // loop. On wasm32 this is a no-op and the browser GPU thread
+        // delivers the callback when the mapping is ready.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.device
+                .device()
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .ok();
+        }
+
+        struct ReadbackFuture(std::sync::Arc<std::sync::Mutex<State>>);
+        impl std::future::Future for ReadbackFuture {
+            type Output = std::result::Result<(), wgpu::BufferAsyncError>;
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                let mut s = self.0.lock().unwrap();
+                if let Some(r) = s.result.take() {
+                    std::task::Poll::Ready(r)
+                } else {
+                    s.waker = Some(cx.waker().clone());
+                    std::task::Poll::Pending
+                }
+            }
+        }
+        ReadbackFuture(state)
+            .await
+            .map_err(|e| crate::Error::Msg(format!("wgpu: buffer map_async failed: {e}")))?;
+
+        let cpu = {
+            let view = slice.get_mapped_range();
+            cpu_storage_from_bytes(self.dtype, self.len, &view[..payload_bytes as usize])?
+        };
+        staging.unmap();
+        Ok(cpu)
+    }
 }
 
 impl BackendStorage for WgpuStorage {

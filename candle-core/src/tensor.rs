@@ -2424,6 +2424,43 @@ impl Tensor {
         }
     }
 
+    /// Async variant of [`Self::to_device`] that uses `WgpuStorage::read_to_cpu_async`
+    /// when reading back from a WebGPU buffer to host memory. On `wasm32`
+    /// the synchronous readback path deadlocks because the JS event loop
+    /// can't drain the GPU's `map_async` callback while the worker is
+    /// blocked on `recv()`; this method awaits a `Future` instead so the
+    /// `wasm-bindgen-futures` executor can yield. All non-Wgpu→Cpu
+    /// transitions delegate to `to_device` (sync paths are unchanged).
+    pub async fn to_device_async(&self, device: &Device) -> Result<Tensor> {
+        if self.device().same_device(device) {
+            return Ok(self.clone());
+        }
+        #[cfg(feature = "wgpu")]
+        {
+            // Only the Wgpu→Cpu hop currently has a native async readback;
+            // every other pair stays on the sync path. The match below
+            // mirrors `to_device`'s arms but routes the async one through
+            // the new `read_to_cpu_async` method.
+            let storage_guard = self.storage();
+            if let (Storage::Wgpu(storage), Device::Cpu) = (&*storage_guard, device) {
+                let cpu_storage = storage.read_to_cpu_async().await?;
+                drop(storage_guard);
+                let op = BackpropOp::new1(self, Op::ToDevice);
+                let tensor_ = Tensor_ {
+                    id: TensorId::new(),
+                    storage: Arc::new(RwLock::new(Storage::Cpu(cpu_storage))),
+                    layout: self.layout.clone(),
+                    op,
+                    is_variable: false,
+                    dtype: self.dtype,
+                    device: device.clone(),
+                };
+                return Ok(Tensor(Arc::new(tensor_)));
+            }
+        }
+        self.to_device(device)
+    }
+
     /// Returns a new tensor duplicating data from the original tensor. New dimensions are inserted
     /// on the left.
     pub fn broadcast_left<S: Into<Shape>>(&self, left_shape: S) -> Result<Self> {
