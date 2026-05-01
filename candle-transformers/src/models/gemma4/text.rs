@@ -1117,7 +1117,27 @@ impl TextModel {
         }
         let norm = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb_m.pp("norm"))?;
         let lm_head = if cfg.tie_word_embeddings {
-            Linear::new(embed_tokens.embeddings().clone(), None)
+            // The default tied behavior shares `embed_tokens.embeddings()`
+            // verbatim, which keeps `lm_head` on whatever device the
+            // embedding table loaded onto. For Gemma 3n / Gemma 4 the
+            // chat-pwa pins `embed_tokens` on CPU (it's ~800 MB and
+            // we want to keep WebGPU pressure low), but per-token
+            // BF16 matmul against an 800 MB weight on CPU is the
+            // single biggest bottleneck — every step pays a 1.6 GB
+            // f32-scratch round-trip plus the gemm itself.
+            //
+            // Untie by explicitly moving the weight onto the
+            // VarBuilder's device. For chat-pwa that's the WebGPU
+            // device, where the matmul is a single dispatch + a 1 MB
+            // logits readback. Memory cost: +800 MB GPU; perf gain:
+            // ~10× tokens-per-second.
+            let weight = embed_tokens.embeddings().clone();
+            let weight = if !weight.device().same_device(vb.device()) {
+                weight.to_device(vb.device())?
+            } else {
+                weight
+            };
+            Linear::new(weight, None)
         } else {
             candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
