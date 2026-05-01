@@ -384,6 +384,12 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn affine(&self, layout: &Layout, mul: f64, add: f64) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            let f32_in = promote_bf16_to_f32(self, layout)?;
+            let f32_l = Layout::contiguous(layout.shape());
+            let f32_out = super::ops::affine::affine(&f32_in, &f32_l, mul, add)?;
+            return demote_f32_to_bf16(&f32_out, layout.shape());
+        }
         super::ops::affine::affine(self, layout, mul, add)
     }
 
@@ -396,6 +402,18 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn reduce_op(&self, op: ReduceOp, layout: &Layout, reduce_dims: &[usize]) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            let f32_in = promote_bf16_to_f32(self, layout)?;
+            let f32_l = Layout::contiguous(layout.shape());
+            let f32_out = super::ops::reduce::reduce_op(&f32_in, op, &f32_l, reduce_dims)?;
+            // Reduce keeps `reduce_dims` as size-1 axes. The output shape
+            // is inferred from the (input shape, reduce_dims) pair.
+            let mut out_shape: Vec<usize> = layout.dims().to_vec();
+            for &d in reduce_dims {
+                out_shape[d] = 1;
+            }
+            return demote_f32_to_bf16(&f32_out, &Shape::from(out_shape));
+        }
         super::ops::reduce::reduce_op(self, op, layout, reduce_dims)
     }
 
@@ -408,6 +426,12 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn unary_impl<B: UnaryOpT>(&self, layout: &Layout) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            let f32_in = promote_bf16_to_f32(self, layout)?;
+            let f32_l = Layout::contiguous(layout.shape());
+            let f32_out = super::ops::unary::unary::<B>(&f32_in, &f32_l)?;
+            return demote_f32_to_bf16(&f32_out, layout.shape());
+        }
         super::ops::unary::unary::<B>(self, layout)
     }
 
@@ -417,6 +441,20 @@ impl BackendStorage for WgpuStorage {
         lhs_layout: &Layout,
         rhs_layout: &Layout,
     ) -> Result<Self> {
+        if self.dtype == DType::BF16 || rhs.dtype == DType::BF16 {
+            // Binary requires matching dtype; if either is bf16 both must be.
+            let lhs_f32 = promote_bf16_to_f32(self, lhs_layout)?;
+            let rhs_f32 = promote_bf16_to_f32(rhs, rhs_layout)?;
+            let lhs_l = Layout::contiguous(lhs_layout.shape());
+            let rhs_l = Layout::contiguous(rhs_layout.shape());
+            let f32_out =
+                super::ops::binary::binary::<B>(&lhs_f32, &rhs_f32, &lhs_l, &rhs_l)?;
+            // Output shape mirrors the broadcast shape selected by the
+            // existing binary kernel — for matching shapes that's the
+            // shared shape, for stride-0 broadcasts it's the larger dim.
+            let out_shape = broadcast_shape(lhs_layout.shape(), rhs_layout.shape())?;
+            return demote_f32_to_bf16(&f32_out, &out_shape);
+        }
         super::ops::binary::binary::<B>(self, rhs, lhs_layout, rhs_layout)
     }
 
@@ -521,6 +559,16 @@ impl BackendStorage for WgpuStorage {
     }
 
     fn index_select(&self, ids: &Self, src_l: &Layout, ids_l: &Layout, dim: usize) -> Result<Self> {
+        if self.dtype == DType::BF16 {
+            let f32_src = promote_bf16_to_f32(self, src_l)?;
+            let f32_src_l = Layout::contiguous(src_l.shape());
+            let f32_out =
+                super::ops::index_select::index_select(&f32_src, ids, &f32_src_l, ids_l, dim)?;
+            // Output shape replaces `dim` with the length of `ids`.
+            let mut out_shape: Vec<usize> = src_l.dims().to_vec();
+            out_shape[dim] = ids_l.shape().elem_count();
+            return demote_f32_to_bf16(&f32_out, &Shape::from(out_shape));
+        }
         super::ops::index_select::index_select(self, ids, src_l, ids_l, dim)
     }
 
@@ -575,6 +623,72 @@ impl BackendStorage for WgpuStorage {
     fn const_set(&mut self, _: crate::scalar::Scalar, _: &Layout) -> Result<()> {
         Self::not_implemented("const_set")
     }
+}
+
+// ── BF16 auto-promotion helpers ──────────────────────────────────────
+//
+// The wgpu compute kernels for unary, binary, reduce, affine,
+// index_select, softmax, and rope all run in f32 (the f16 paths are
+// gated behind a naga `enable f16;` limitation). For models that load
+// weights in bf16 — Gemma4 in the chat-pwa being the motivating case —
+// we route bf16 operands through a transient f32 round-trip:
+//
+//   bf16 input  ──cast──▶  f32 contig  ──f32 op──▶  f32 out  ──cast──▶  bf16 out
+//
+// `cast::to_dtype` requires a contiguous source, so non-contiguous bf16
+// layouts (transposes, broadcast views) are first materialised via
+// `copy::copy_strided_src` (which now has a bf16 path) before the cast.
+//
+// Memory cost: ~2× the operand size in scratch f32 storage during the
+// op. For Gemma4 forward pass operands (per-token activations of a few
+// MB) that's negligible. For matmul we keep the native bf16 kernel
+// because rhs weights would be tens of GB and casting them per-call
+// would dominate VRAM.
+
+pub(super) fn promote_bf16_to_f32(s: &WgpuStorage, l: &Layout) -> Result<WgpuStorage> {
+    debug_assert_eq!(s.dtype, DType::BF16);
+    if l.is_contiguous() {
+        // `cast::to_dtype` honors `start_offset` so a contiguous-with-
+        // offset layout is fine without a materialise step.
+        return super::ops::cast::to_dtype(s, l, DType::F32);
+    }
+    // Materialise a contiguous bf16 copy at offset 0, then cast.
+    let shape = l.shape();
+    let mut tmp = WgpuStorage::alloc_zeros(s.device.clone(), DType::BF16, shape)?;
+    super::ops::copy::copy_strided_src(s, &mut tmp, 0, l)?;
+    super::ops::cast::to_dtype(&tmp, &Layout::contiguous(shape), DType::F32)
+}
+
+pub(super) fn demote_f32_to_bf16(s: &WgpuStorage, shape: &Shape) -> Result<WgpuStorage> {
+    debug_assert_eq!(s.dtype, DType::F32);
+    super::ops::cast::to_dtype(s, &Layout::contiguous(shape), DType::BF16)
+}
+
+/// Broadcast two shapes per numpy/candle rules. Returns the broadcast
+/// shape or an error if the shapes are incompatible.
+fn broadcast_shape(lhs: &Shape, rhs: &Shape) -> Result<Shape> {
+    let l = lhs.dims();
+    let r = rhs.dims();
+    let n = l.len().max(r.len());
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let ld = l.get(l.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(1);
+        let rd = r.get(r.len().wrapping_sub(1).wrapping_sub(i)).copied().unwrap_or(1);
+        let d = if ld == rd {
+            ld
+        } else if ld == 1 {
+            rd
+        } else if rd == 1 {
+            ld
+        } else {
+            return Err(crate::Error::Msg(format!(
+                "wgpu: bf16 binary auto-promote: incompatible shapes {l:?} vs {r:?}"
+            )));
+        };
+        out.push(d);
+    }
+    out.reverse();
+    Ok(Shape::from(out))
 }
 
 // Silence unused-import warnings on the rare path where neither variant

@@ -33,6 +33,7 @@ use crate::{DType, Layout, Result, StridedBlocks};
 use super::super::storage::WgpuStorage;
 
 const TEMPLATE: &str = include_str!("../kernels/copy.wgsl");
+const TEMPLATE_BF16: &str = include_str!("../kernels/copy_strided_bf16.wgsl");
 const MAX_RANK: usize = 4;
 const WORKGROUP_SIZE: u32 = 64;
 
@@ -75,6 +76,14 @@ fn elem_bytes(dtype: DType) -> Result<u64> {
 
 /// Pipeline cache key for the f32 strided ucopy kernel.
 const UCOPY_KEY_F32: &str = "ucopy:f32";
+/// Pipeline cache key for the bf16 strided ucopy kernel.
+const UCOPY_KEY_BF16: &str = "ucopy:bf16";
+
+#[derive(Clone, Copy)]
+enum UcopyVariant {
+    F32,
+    Bf16,
+}
 
 /// Issue an in-place strided→contiguous copy: writes `src` (interpreted
 /// via `src_l`) into `dst.buffer` starting at element index `dst_offset`.
@@ -119,22 +128,26 @@ pub(crate) fn copy_strided_src(
         return Ok(());
     }
 
-    // Strided fallback: dispatch the ucopy kernel. f32 only for now;
-    // f16 is gated behind the same naga limit as the rest of the
-    // f-typed kernels.
-    if src.dtype != DType::F32 {
-        if src.dtype == DType::F16 {
+    // Strided fallback: dispatch the ucopy kernel. f32 has a typed shader;
+    // bf16 has a packed-u32 shader using atomicAnd/atomicOr to update
+    // half-words without disturbing the rest of `dst`. f16 still rides
+    // the same naga `enable f16;` gate as the other f-typed kernels.
+    let variant = match src.dtype {
+        DType::F32 => UcopyVariant::F32,
+        DType::BF16 => UcopyVariant::Bf16,
+        DType::F16 => {
             return Err(crate::Error::Msg(
                 "wgpu: copy_strided_src on f16 strided source deferred \
                  (naga `enable f16;` gate)"
                     .to_string(),
             ));
         }
-        return Err(crate::Error::Msg(format!(
-            "wgpu: copy_strided_src not implemented for strided dtype {:?}",
-            src.dtype
-        )));
-    }
+        other => {
+            return Err(crate::Error::Msg(format!(
+                "wgpu: copy_strided_src not implemented for strided dtype {other:?}"
+            )));
+        }
+    };
 
     let dims = src_l.dims();
     if dims.len() > MAX_RANK {
@@ -187,8 +200,11 @@ pub(crate) fn copy_strided_src(
     };
 
     let device = &src.device;
-    let wgsl = render_wgsl("f32");
-    let pipeline = device.get_or_create_pipeline(UCOPY_KEY_F32, &wgsl, "main");
+    let (cache_key, wgsl) = match variant {
+        UcopyVariant::F32 => (UCOPY_KEY_F32, render_wgsl("f32")),
+        UcopyVariant::Bf16 => (UCOPY_KEY_BF16, TEMPLATE_BF16.to_string()),
+    };
+    let pipeline = device.get_or_create_pipeline(cache_key, &wgsl, "main");
 
     let meta_buffer = device.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu-ucopy-meta"),

@@ -38,6 +38,16 @@ fn render_wgsl() -> String {
 }
 
 pub fn softmax_last_dim(src: &WgpuStorage, layout: &Layout) -> Result<(WgpuStorage, Shape)> {
+    // bf16 → f32 → bf16 round-trip. The f32 softmax kernel is the only
+    // one we have today, so bf16 inputs are auto-promoted.
+    if src.dtype == DType::BF16 {
+        let f32_in = super::super::storage::promote_bf16_to_f32(src, layout)?;
+        let f32_l = Layout::contiguous(layout.shape());
+        let (f32_out, out_shape) = softmax_last_dim(&f32_in, &f32_l)?;
+        let bf16_out = super::super::storage::demote_f32_to_bf16(&f32_out, &out_shape)?;
+        return Ok((bf16_out, out_shape));
+    }
+
     let device = &src.device;
 
     if src.dtype != DType::F32 {

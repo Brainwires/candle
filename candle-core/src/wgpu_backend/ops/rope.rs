@@ -20,6 +20,7 @@
 
 #![allow(dead_code)]
 
+use crate::backend::BackendStorage;
 use crate::{DType, Layout, Result, Shape};
 use std::sync::Arc;
 
@@ -92,6 +93,62 @@ pub fn rope(
     sin: &WgpuStorage,
     sin_l: &Layout,
 ) -> Result<(WgpuStorage, Shape)> {
+    // bf16 round-trip: promote all three inputs, run f32 rope, demote
+    // the output. cos/sin are typically already f32 (they come from
+    // `RotaryEmbedding::new`'s f32 sin/cos table — see the gemma4
+    // ProportionalRotaryEmbedding pattern); this branch exists so a
+    // bf16 src + bf16 cos/sin combination doesn't fall off the bf16 cliff.
+    if src.dtype == DType::BF16 || cos.dtype == DType::BF16 || sin.dtype == DType::BF16 {
+        // Lift each operand to f32 (idempotent if already f32).
+        let lift =
+            |s: &WgpuStorage, l: &Layout| -> Result<WgpuStorage> {
+                if s.dtype == DType::F32 {
+                    if l.is_contiguous() {
+                        // f32 contiguous already — clone the buffer view as-is.
+                        // (try_clone copies bytes; cheap for the small cos/sin tables.)
+                        s.try_clone(l)
+                    } else {
+                        // Materialise f32 contiguous via the cast identity path
+                        // (which routes through copy_strided for non-contiguous src).
+                        let mut tmp = WgpuStorage::alloc_zeros(
+                            s.device.clone(),
+                            DType::F32,
+                            l.shape(),
+                        )?;
+                        super::copy::copy_strided_src(s, &mut tmp, 0, l)?;
+                        Ok(tmp)
+                    }
+                } else if s.dtype == DType::BF16 {
+                    super::super::storage::promote_bf16_to_f32(s, l)
+                } else {
+                    Err(crate::Error::Msg(format!(
+                        "wgpu: rope expected f32 or bf16, got {:?}",
+                        s.dtype
+                    )))
+                }
+            };
+        let src_f32 = lift(src, src_l)?;
+        let cos_f32 = lift(cos, cos_l)?;
+        let sin_f32 = lift(sin, sin_l)?;
+        let src_l_f32 = Layout::contiguous(src_l.shape());
+        let cos_l_f32 = Layout::contiguous(cos_l.shape());
+        let sin_l_f32 = Layout::contiguous(sin_l.shape());
+        let (f32_out, out_shape) = rope(
+            variant,
+            &src_f32,
+            &src_l_f32,
+            &cos_f32,
+            &cos_l_f32,
+            &sin_f32,
+            &sin_l_f32,
+        )?;
+        // Demote back to whatever dtype `src` was.
+        if src.dtype == DType::BF16 {
+            let bf16_out = super::super::storage::demote_f32_to_bf16(&f32_out, &out_shape)?;
+            return Ok((bf16_out, out_shape));
+        }
+        return Ok((f32_out, out_shape));
+    }
     if src.dtype != DType::F32 || cos.dtype != DType::F32 || sin.dtype != DType::F32 {
         if src.dtype == DType::F16 || cos.dtype == DType::F16 || sin.dtype == DType::F16 {
             return Err(crate::Error::Msg(

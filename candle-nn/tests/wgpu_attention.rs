@@ -16,6 +16,7 @@
 #![cfg(feature = "wgpu")]
 
 use candle::{DType, Device, Result, Tensor, D};
+use half::bf16;
 
 fn try_wgpu() -> Option<Device> {
     Device::new_wgpu(0).ok()
@@ -275,4 +276,83 @@ fn rope_then_causal_attention_f32() -> Result<()> {
     let got = run(&qg, &kg, &vg, &cosg, &sing, &mg)?;
     assert_close(&want, &got, 1e-3, "rope+causal-sdpa");
     Ok(())
+}
+
+// ── bf16 coverage ───────────────────────────────────────────────────
+//
+// bf16 inputs to softmax and rope ride the storage-level auto-promote
+// (cast → f32 op → cast). Tolerance is loose (5e-2) because every bf16
+// operand carries 7 mantissa bits and softmax/rope each accumulate.
+
+const BF16_TOL: f32 = 5e-2;
+
+fn assert_close_bf16(cpu: &Tensor, gpu: &Tensor, label: &str) -> Result<()> {
+    let r: Vec<bf16> = cpu.flatten_all()?.to_vec1()?;
+    let g: Vec<bf16> = gpu.to_device(&Device::Cpu)?.flatten_all()?.to_vec1()?;
+    assert_eq!(r.len(), g.len(), "{label}: length mismatch");
+    let mut max_err = 0f32;
+    let mut idx = 0;
+    for (i, (a, b)) in r.iter().zip(g.iter()).enumerate() {
+        let e = (a.to_f32() - b.to_f32()).abs();
+        if e > max_err {
+            max_err = e;
+            idx = i;
+        }
+    }
+    assert!(
+        max_err < BF16_TOL,
+        "{label}: max abs diff {max_err} > tol {BF16_TOL} at index {idx} (cpu={} gpu={})",
+        r[idx].to_f32(),
+        g[idx].to_f32(),
+    );
+    Ok(())
+}
+
+#[test]
+fn rope_bf16_split_halves() -> Result<()> {
+    let Some(dev) = try_wgpu() else {
+        eprintln!("[skip] no wgpu adapter");
+        return Ok(());
+    };
+    let (b, h, t, d) = (1usize, 2, 4, 8);
+    let cpu = Device::Cpu;
+    let xs_data: Vec<bf16> = (0..b * h * t * d)
+        .map(|i| bf16::from_f32(((i as f32) * 0.013).sin()))
+        .collect();
+    let cos_data: Vec<bf16> = (0..t * d / 2)
+        .map(|i| bf16::from_f32(((i as f32) * 0.05).cos()))
+        .collect();
+    let sin_data: Vec<bf16> = (0..t * d / 2)
+        .map(|i| bf16::from_f32(((i as f32) * 0.05).sin()))
+        .collect();
+
+    let xs_c = Tensor::from_vec(xs_data.clone(), (b, h, t, d), &cpu)?;
+    let cos_c = Tensor::from_vec(cos_data.clone(), (t, d / 2), &cpu)?;
+    let sin_c = Tensor::from_vec(sin_data.clone(), (t, d / 2), &cpu)?;
+    let xs_g = Tensor::from_vec(xs_data, (b, h, t, d), &dev)?;
+    let cos_g = Tensor::from_vec(cos_data, (t, d / 2), &dev)?;
+    let sin_g = Tensor::from_vec(sin_data, (t, d / 2), &dev)?;
+
+    let want = candle_nn::rotary_emb::rope(&xs_c, &cos_c, &sin_c)?;
+    let got = candle_nn::rotary_emb::rope(&xs_g, &cos_g, &sin_g)?;
+    assert_eq!(got.dtype(), DType::BF16);
+    assert_close_bf16(&want, &got, "rope_bf16")
+}
+
+#[test]
+fn softmax_last_dim_bf16() -> Result<()> {
+    let Some(dev) = try_wgpu() else {
+        eprintln!("[skip] no wgpu adapter");
+        return Ok(());
+    };
+    let cpu = Device::Cpu;
+    let data: Vec<bf16> = (0..32)
+        .map(|i| bf16::from_f32(((i as f32) * 0.1).sin()))
+        .collect();
+    let xs_c = Tensor::from_vec(data.clone(), (4, 8), &cpu)?;
+    let xs_g = Tensor::from_vec(data, (4, 8), &dev)?;
+    let want = candle_nn::ops::softmax_last_dim(&xs_c)?;
+    let got = candle_nn::ops::softmax_last_dim(&xs_g)?;
+    assert_eq!(got.dtype(), DType::BF16);
+    assert_close_bf16(&want, &got, "softmax_last_dim_bf16")
 }
