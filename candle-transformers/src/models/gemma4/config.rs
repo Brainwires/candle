@@ -115,6 +115,20 @@ pub struct Gemma4TextConfig {
     pub use_bidirectional_attention: Option<String>,
     #[serde(default = "default_use_flash_attn")]
     pub use_flash_attn: bool,
+
+    // ── Per-Layer Embeddings (Gemma 3n) ─────────────────────────────────
+    /// Width of each per-layer auxiliary embedding (the small dim that
+    /// gets added into every decoder layer alongside the main residual
+    /// stream). `None` disables PLE entirely; Gemma 3n's E2B sets this
+    /// to 256.
+    #[serde(default)]
+    pub hidden_size_per_layer_input: Option<usize>,
+    /// Vocabulary size of the per-layer embedding table. Gemma 3n uses a
+    /// dedicated 262_144-entry table that's distinct from the main
+    /// `vocab_size` (which adds soft-image / soft-audio token IDs on
+    /// top). `None` falls back to the main `vocab_size`.
+    #[serde(default)]
+    pub vocab_size_per_layer_input: Option<usize>,
 }
 
 impl Gemma4TextConfig {

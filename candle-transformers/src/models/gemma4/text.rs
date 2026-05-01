@@ -451,6 +451,10 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        // Per-layer-input slice `[B, T, hidden_per_layer]` — Gemma 3n's
+        // PLE side-channel. Wired through but unused in Phase 2; Phase 3
+        // consumes it as part of the AltUp correction tail.
+        _per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
@@ -509,11 +513,101 @@ fn prepare_decoder_attention_mask(
         .to_dtype(dtype)
 }
 
+// ── Per-Layer Embeddings (Gemma 3n) ────────────────────────────────────────
+//
+// Each token gets an additional small per-layer signal added on top of
+// the main residual stream. The forward computes a `[B, T, num_layers,
+// hidden_per_layer]` table once and the layer-i decoder takes its slice
+// `[B, T, hidden_per_layer]` as a side-channel input. Mirrors HF's
+// `Gemma3nTextModel` lines ~2399–2430.
+
+#[derive(Debug, Clone)]
+struct PerLayerEmbedding {
+    /// Looks up `[B, T] -> [B, T, num_layers * hidden_per_layer]`.
+    embed_tokens_per_layer: candle_nn::Embedding,
+    /// Projects the main `inputs_embeds` `[B, T, hidden_size]` into the
+    /// same `num_layers * hidden_per_layer` space so the two signals
+    /// can be summed.
+    per_layer_model_projection: Linear,
+    /// RMSNorm applied to the projection before it's merged with the
+    /// embed-table lookup.
+    per_layer_projection_norm: RmsNorm,
+    /// Buffer scale = `1 / √hidden_size` (HF computes this as
+    /// `hidden_size ** -0.5`). Multiplied into the projection so the
+    /// merged signal stays at unit-ish variance.
+    per_layer_projection_scale: f64,
+    num_hidden_layers: usize,
+    hidden_per_layer: usize,
+    /// `1 / √2` — applied to the merged sum so the per-layer signal
+    /// doesn't double-up the magnitude when the two sources are
+    /// equally scaled. `rsqrt(2.0)` in HF speak.
+    per_layer_input_scale: f64,
+}
+
+impl PerLayerEmbedding {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_per_layer = cfg
+            .hidden_size_per_layer_input
+            .ok_or_else(|| candle::Error::Msg(
+                "PerLayerEmbedding requires `hidden_size_per_layer_input`".into(),
+            ))?;
+        let vocab_per_layer = cfg.vocab_size_per_layer_input.unwrap_or(cfg.vocab_size);
+        let total = cfg.num_hidden_layers * hidden_per_layer;
+        let embed_tokens_per_layer = candle_nn::embedding(
+            vocab_per_layer,
+            total,
+            vb.pp("embed_tokens_per_layer"),
+        )?;
+        let per_layer_model_projection =
+            candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("per_layer_model_projection"))?;
+        let per_layer_projection_norm = RmsNorm::new(
+            total,
+            cfg.rms_norm_eps,
+            vb.pp("per_layer_projection_norm"),
+        )?;
+        Ok(Self {
+            embed_tokens_per_layer,
+            per_layer_model_projection,
+            per_layer_projection_norm,
+            per_layer_projection_scale: (cfg.hidden_size as f64).powf(-0.5),
+            num_hidden_layers: cfg.num_hidden_layers,
+            hidden_per_layer,
+            per_layer_input_scale: (2.0_f64).powf(-0.5),
+        })
+    }
+
+    /// Compute the full per-layer-input table for the current token slice.
+    /// Returns `[B, T, num_layers, hidden_per_layer]` with the *same*
+    /// dtype as `inputs_embeds`.
+    fn forward(&self, input_ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
+        let (b, t) = input_ids.dims2()?;
+        // `embed_tokens_per_layer(ids)` -> [B, T, L*H_per]
+        let table = self.embed_tokens_per_layer.forward(input_ids)?;
+        let table = table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+
+        // Project inputs_embeds and reshape to match.
+        let proj = inputs_embeds.apply(&self.per_layer_model_projection)?;
+        // Multiply by 1/√hidden_size before the RMSNorm so the trained
+        // scale lines up with HF.
+        let proj = (proj * self.per_layer_projection_scale)?;
+        let proj = proj.apply(&self.per_layer_projection_norm)?;
+        let proj =
+            proj.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+
+        // (proj + table) * rsqrt(2)
+        let merged = (proj.broadcast_add(&table)? * self.per_layer_input_scale)?;
+        Ok(merged.contiguous()?)
+    }
+}
+
 // ── TextModel ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct TextModel {
     embed_tokens: candle_nn::Embedding,
+    /// Optional per-layer-embedding side-channel. `None` for non-Gemma3n
+    /// configs that don't carry `hidden_size_per_layer_input`.
+    per_layer_embedding: Option<PerLayerEmbedding>,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: Linear,
@@ -564,8 +658,14 @@ impl TextModel {
         } else {
             candle_nn::linear_no_bias(cfg.hidden_size, cfg.vocab_size, vb.pp("lm_head"))?
         };
+        let per_layer_embedding = if cfg.hidden_size_per_layer_input.is_some() {
+            Some(PerLayerEmbedding::new(cfg, vb_m.clone())?)
+        } else {
+            None
+        };
         Ok(Self {
             embed_tokens,
+            per_layer_embedding,
             layers,
             norm,
             lm_head,
@@ -623,16 +723,35 @@ impl TextModel {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        self.forward_embeds_with_per_layer(xs, None, seqlen_offset, batch_size, seq_len)
+    }
+
+    /// Variant that accepts the precomputed Gemma 3n per-layer-input
+    /// table `[B, T, num_layers, hidden_per_layer]`. When `per_layer_inputs`
+    /// is `Some`, the layer-i decoder receives its `[..., i, :]` slice.
+    pub fn forward_embeds_with_per_layer(
+        &mut self,
+        xs: &Tensor,
+        per_layer_inputs: Option<&Tensor>,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
 
         let mut xs = xs.clone();
-        for layer in self.layers.iter_mut() {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let per_layer_slice = match per_layer_inputs {
+                Some(table) => Some(table.narrow(2, layer_idx, 1)?.squeeze(2)?),
+                None => None,
+            };
             xs = layer.forward(
                 &xs,
                 attention_mask.as_ref(),
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
+                per_layer_slice.as_ref(),
             )?
         }
         let logits = xs
@@ -656,19 +775,51 @@ impl TextModel {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
+        self.forward_embeds_hidden_with_per_layer(xs, None, seqlen_offset, batch_size, seq_len)
+    }
+
+    /// Same as [`Self::forward_embeds_hidden`] with an explicit
+    /// per-layer-input table for Gemma 3n.
+    pub fn forward_embeds_hidden_with_per_layer(
+        &mut self,
+        xs: &Tensor,
+        per_layer_inputs: Option<&Tensor>,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+    ) -> Result<Tensor> {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
 
         let mut xs = xs.clone();
-        for layer in self.layers.iter_mut() {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let per_layer_slice = match per_layer_inputs {
+                Some(table) => Some(table.narrow(2, layer_idx, 1)?.squeeze(2)?),
+                None => None,
+            };
             xs = layer.forward(
                 &xs,
                 attention_mask.as_ref(),
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
+                per_layer_slice.as_ref(),
             )?
         }
         xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
+    }
+
+    /// Compute the Gemma 3n per-layer-input table once for a given
+    /// `(input_ids, inputs_embeds)` pair. Returns `None` when the model
+    /// wasn't constructed with PLE.
+    pub fn compute_per_layer_inputs(
+        &self,
+        input_ids: &Tensor,
+        inputs_embeds: &Tensor,
+    ) -> Result<Option<Tensor>> {
+        match &self.per_layer_embedding {
+            Some(ple) => Ok(Some(ple.forward(input_ids, inputs_embeds)?)),
+            None => Ok(None),
+        }
     }
 
     /// Project hidden states to logits via the lm_head linear layer.
