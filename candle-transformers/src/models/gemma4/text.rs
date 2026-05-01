@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use candle::{DType, Device, Module, Result, Tensor, D};
+use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{linear_b as linear_bias, Activation, Linear, VarBuilder};
 
 use super::config::Gemma4TextConfig;
@@ -382,6 +382,159 @@ impl Attention {
 
 // ── DecoderLayer ────────────────────────────────────────────────────────────
 
+// ── LAuReL (Learned Augmented Residual Layer) ──────────────────────────────
+//
+// Low-rank residual augmentation applied alongside the attention output.
+// Mirrors HF `Gemma3nTextLaurelBlock`: project hidden→rank→hidden,
+// RMSNorm, add to the original hidden_states.
+
+#[derive(Debug, Clone)]
+struct LaurelBlock {
+    linear_left: Linear,
+    linear_right: Linear,
+    post_laurel_norm: RmsNorm,
+}
+
+impl LaurelBlock {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        let linear_left =
+            candle_nn::linear_no_bias(cfg.hidden_size, cfg.laurel_rank, vb.pp("linear_left"))?;
+        let linear_right =
+            candle_nn::linear_no_bias(cfg.laurel_rank, cfg.hidden_size, vb.pp("linear_right"))?;
+        let post_laurel_norm =
+            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("post_laurel_norm"))?;
+        Ok(Self {
+            linear_left,
+            linear_right,
+            post_laurel_norm,
+        })
+    }
+
+    fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        let laurel = hidden.apply(&self.linear_left)?.apply(&self.linear_right)?;
+        let normed = self.post_laurel_norm.forward(&laurel)?;
+        hidden + normed
+    }
+}
+
+// ── AltUp (Alternating Updates) ────────────────────────────────────────────
+//
+// Maintains `altup_num_inputs` parallel hidden streams. Each layer
+// runs predict → activate (the layer's main attn+MLP path on the active
+// stream) → correct over the full stack, returning the corrected stack
+// for the next layer. Mirrors HF `Gemma3nTextAltUp`.
+
+#[derive(Debug, Clone)]
+struct AltUp {
+    correct_output_scale: Tensor,
+    correction_coefs: Linear,
+    prediction_coefs: Linear,
+    modality_router: Linear,
+    router_norm: RmsNorm,
+    /// `1 / hidden_size` — applied to the modality vector before the
+    /// router projection. Buffer in HF speak.
+    router_input_scale: f64,
+    altup_num_inputs: usize,
+    altup_active_idx: usize,
+}
+
+impl AltUp {
+    fn new(cfg: &Gemma4TextConfig, vb: VarBuilder) -> Result<Self> {
+        let correct_output_scale =
+            vb.get(cfg.hidden_size, "correct_output_scale")?;
+        let correction_coefs = candle_nn::linear_no_bias(
+            cfg.altup_num_inputs,
+            cfg.altup_num_inputs,
+            vb.pp("correction_coefs"),
+        )?;
+        let prediction_coefs = candle_nn::linear_no_bias(
+            cfg.altup_num_inputs,
+            cfg.altup_num_inputs * cfg.altup_num_inputs,
+            vb.pp("prediction_coefs"),
+        )?;
+        let modality_router = candle_nn::linear_no_bias(
+            cfg.hidden_size,
+            cfg.altup_num_inputs,
+            vb.pp("modality_router"),
+        )?;
+        let router_norm =
+            RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("router_norm"))?;
+        Ok(Self {
+            correct_output_scale,
+            correction_coefs,
+            prediction_coefs,
+            modality_router,
+            router_norm,
+            router_input_scale: (cfg.hidden_size as f64).powf(-1.0),
+            altup_num_inputs: cfg.altup_num_inputs,
+            altup_active_idx: cfg.altup_active_idx,
+        })
+    }
+
+    /// `tanh(modality_router(router_norm(x) * router_input_scale))`
+    fn compute_router_modalities(&self, x: &Tensor) -> Result<Tensor> {
+        let normed = self.router_norm.forward(x)?;
+        let scaled = (normed * self.router_input_scale)?;
+        scaled.apply(&self.modality_router)?.tanh()
+    }
+
+    /// `predict(stack) -> stack + (predicted_residual_per_input)`
+    /// `stack` shape: `[num_inputs, B, T, hidden]`
+    fn predict(&self, stack: &Tensor) -> Result<Tensor> {
+        let active = stack.i(self.altup_active_idx)?;
+        let modalities = self.compute_router_modalities(&active)?; // [B, T, num_inputs]
+
+        // prediction_coefs: [B, T, num_inputs²]
+        let coefs = self.prediction_coefs.forward(&modalities)?;
+        let bt = coefs.dims();
+        let (b, t) = (bt[0], bt[1]);
+        // [B, T, num_inputs, num_inputs] then permute last two so matmul gives the right thing
+        let coefs = coefs
+            .reshape((b, t, self.altup_num_inputs, self.altup_num_inputs))?
+            .transpose(2, 3)?;
+
+        // Permute stack [num_inputs, B, T, H] -> [B, T, H, num_inputs]
+        let permuted = stack.permute((1, 2, 3, 0))?.contiguous()?;
+        // matmul (B, T, H, num_inputs) @ (B, T, num_inputs, num_inputs) -> (B, T, H, num_inputs)
+        let predicted = permuted.matmul(&coefs.contiguous()?)?;
+        // Undo permute back to [num_inputs, B, T, H]
+        let predicted = predicted.permute((3, 0, 1, 2))?.contiguous()?;
+        let result = (predicted + stack)?;
+        result.contiguous()
+    }
+
+    /// `correct(predictions, activated)`. Predictions: `[num_inputs, B, T, H]`,
+    /// activated: `[B, T, H]`. Returns `[num_inputs, B, T, H]`.
+    fn correct(&self, predictions: &Tensor, activated: &Tensor) -> Result<Tensor> {
+        let modalities = self.compute_router_modalities(activated)?; // [B, T, num_inputs]
+        let active_pred = predictions.i(self.altup_active_idx)?;
+        let innovation = (activated - &active_pred)?;
+        // Repeat across num_inputs dim: [num_inputs, B, T, H]
+        let innovation =
+            innovation
+                .unsqueeze(0)?
+                .broadcast_as(predictions.shape())?
+                .contiguous()?;
+
+        let coefs = self.correction_coefs.forward(&modalities)?; // [B, T, num_inputs]
+        // +1.0 (the trained "identity" baseline)
+        let coefs = (coefs + 1.0)?;
+        // Permute [B, T, num_inputs] -> [num_inputs, B, T] then unsqueeze for H broadcast
+        let coefs = coefs.permute((2, 0, 1))?.unsqueeze(3)?.contiguous()?;
+
+        let scaled = innovation.broadcast_mul(&coefs)?;
+        let corrected = (scaled + predictions)?;
+        corrected.contiguous()
+    }
+
+    /// Multiplies the active stream by the learnable per-feature scale.
+    fn scale_corrected_output(&self, x: &Tensor) -> Result<Tensor> {
+        x.broadcast_mul(&self.correct_output_scale)
+    }
+}
+
+// ── DecoderLayer ────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 struct DecoderLayer {
     self_attn: Attention,
@@ -392,6 +545,26 @@ struct DecoderLayer {
     post_feedforward_layernorm: RmsNorm,
     #[allow(dead_code)]
     is_sliding: bool,
+
+    // ── Gemma 3n additions ──────────────────────────────────────────────
+    /// `None` for non-3n configs (no AltUp); decoder behaves classically.
+    altup: Option<AltUp>,
+    /// `None` for non-3n configs.
+    laurel: Option<LaurelBlock>,
+    /// Per-layer-input gate Linear (hidden → hidden_per_layer). Only
+    /// present when PLE is wired.
+    per_layer_input_gate: Option<Linear>,
+    /// hidden_per_layer → hidden projection.
+    per_layer_projection: Option<Linear>,
+    /// Post per-layer-projection RmsNorm.
+    post_per_layer_input_norm: Option<RmsNorm>,
+    /// Activation function for the per-layer-input gate (matches
+    /// `cfg.hidden_activation`). Stored so the gate path can apply the
+    /// same nonlinearity the trained model expects.
+    per_layer_act: Activation,
+    /// `1/√2` constant for the (attn_gated + laurel_out) merge.
+    inv_sqrt_2: f64,
+    altup_correct_scale: bool,
 }
 
 impl DecoderLayer {
@@ -434,6 +607,54 @@ impl DecoderLayer {
             cfg.rms_norm_eps,
             vb.pp("post_feedforward_layernorm"),
         )?;
+
+        // Gemma 3n additions: only construct AltUp / LAuReL / per-layer-
+        // input gate when the config carries the corresponding fields.
+        // For pure Gemma 3 / Gemma 4 (without AltUp), the layer falls
+        // back to the classic pre-norm + attn + post-norm + ffw flow.
+        let has_altup = cfg.altup_num_inputs > 1;
+        let altup = if has_altup {
+            Some(AltUp::new(cfg, vb.pp("altup"))?)
+        } else {
+            None
+        };
+        let laurel = if cfg.laurel_rank > 0 {
+            // The LaurelBlock weights are present in Gemma 3n
+            // checkpoints; if construction fails (e.g. weights missing
+            // for a non-3n config) we fall back to no-LAuReL.
+            LaurelBlock::new(cfg, vb.pp("laurel")).ok()
+        } else {
+            None
+        };
+        let per_layer_input_gate = if let Some(hidden_per_layer) = cfg.hidden_size_per_layer_input
+        {
+            Some(candle_nn::linear_no_bias(
+                cfg.hidden_size,
+                hidden_per_layer,
+                vb.pp("per_layer_input_gate"),
+            )?)
+        } else {
+            None
+        };
+        let per_layer_projection = if let Some(hidden_per_layer) = cfg.hidden_size_per_layer_input {
+            Some(candle_nn::linear_no_bias(
+                hidden_per_layer,
+                cfg.hidden_size,
+                vb.pp("per_layer_projection"),
+            )?)
+        } else {
+            None
+        };
+        let post_per_layer_input_norm = if cfg.hidden_size_per_layer_input.is_some() {
+            Some(RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("post_per_layer_input_norm"),
+            )?)
+        } else {
+            None
+        };
+
         Ok(Self {
             self_attn,
             mlp,
@@ -442,32 +663,124 @@ impl DecoderLayer {
             pre_feedforward_layernorm,
             post_feedforward_layernorm,
             is_sliding,
+            altup,
+            laurel,
+            per_layer_input_gate,
+            per_layer_projection,
+            post_per_layer_input_norm,
+            per_layer_act: cfg.hidden_activation,
+            inv_sqrt_2: (2.0_f64).powf(-0.5),
+            altup_correct_scale: cfg.altup_correct_scale,
         })
     }
 
+    /// Forward pass for the layer.
+    ///
+    /// Two modes:
+    /// - **Classic** (no AltUp wired): `xs` is `[B, T, hidden]`, returned
+    ///   value is `[B, T, hidden]`. PLE / per-layer-input gate are
+    ///   skipped, and the residual flow is the Gemma 3 path
+    ///   (input_layernorm → self_attn → post_attention_layernorm + res
+    ///   → pre_feedforward_layernorm → mlp → post_feedforward_layernorm
+    ///   + res).
+    /// - **AltUp** (Gemma 3n): `xs` is `[num_inputs, B, T, hidden]`, the
+    ///   active stream is corrected via attention + MLP, the others via
+    ///   the AltUp predict / correct mechanism, and the per-layer-input
+    ///   gate adds the PLE side-channel back into the non-active streams.
+    ///   Returns `[num_inputs, B, T, hidden]`.
     fn forward(
         &mut self,
         xs: &Tensor,
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
-        // Per-layer-input slice `[B, T, hidden_per_layer]` — Gemma 3n's
-        // PLE side-channel. Wired through but unused in Phase 2; Phase 3
-        // consumes it as part of the AltUp correction tail.
-        _per_layer_input: Option<&Tensor>,
+        per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
+        let altup = match &self.altup {
+            Some(a) => a,
+            None => {
+                // Classic path — no AltUp wiring.
+                let residual = xs;
+                let h = self.input_layernorm.forward(xs)?;
+                let h = self
+                    .self_attn
+                    .forward(&h, attention_mask, sliding_attention_mask, seqlen_offset)?;
+                let h = h.apply(&self.post_attention_layernorm)?;
+                let h = (h + residual)?;
+                let residual = &h;
+                let h = h.apply(&self.pre_feedforward_layernorm)?;
+                let h = h.apply(&self.mlp)?;
+                let h = h.apply(&self.post_feedforward_layernorm)?;
+                return residual + h;
+            }
+        };
+
+        // ── AltUp path ───────────────────────────────────────────────
+        // xs: [num_inputs, B, T, hidden]
+        let predictions = altup.predict(xs)?;
+        let active = predictions.i(altup.altup_active_idx)?;
+        let active_norm = self.input_layernorm.forward(&active)?;
+
+        let laurel_out = if let Some(laurel) = &self.laurel {
+            Some(laurel.forward(&active_norm)?)
+        } else {
+            None
+        };
+
+        let attn = self
             .self_attn
-            .forward(&xs, attention_mask, sliding_attention_mask, seqlen_offset)?;
-        let xs = xs.apply(&self.post_attention_layernorm)?;
-        let xs = (xs + residual)?;
-        let residual = &xs;
-        let xs = xs.apply(&self.pre_feedforward_layernorm)?;
-        let xs = xs.apply(&self.mlp)?;
-        let xs = xs.apply(&self.post_feedforward_layernorm)?;
-        residual + xs
+            .forward(&active_norm, attention_mask, sliding_attention_mask, seqlen_offset)?;
+        let attn = attn.apply(&self.post_attention_layernorm)?;
+        let attn_gated = (active + attn)?;
+        let attn_laurel = match laurel_out {
+            Some(l) => ((attn_gated + l)? * self.inv_sqrt_2)?,
+            None => attn_gated,
+        };
+
+        let attn_norm = self.pre_feedforward_layernorm.forward(&attn_laurel)?;
+        let ffw = self.mlp.forward(&attn_norm)?;
+        let ffw = self.post_feedforward_layernorm.forward(&ffw)?;
+        let attn_ffw_laurel_gated = (attn_laurel + ffw)?;
+
+        let corrected = altup.correct(&predictions, &attn_ffw_laurel_gated)?;
+
+        // Per-layer-input gate (Gemma 3n PLE consumption point).
+        let mut corrected = corrected;
+        if let (Some(gate), Some(proj), Some(norm), Some(per_layer_input)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let mut first = corrected.i(altup.altup_active_idx)?.contiguous()?;
+            if self.altup_correct_scale {
+                first = altup.scale_corrected_output(&first)?;
+            }
+            // gate: [..., hidden] -> [..., hidden_per_layer]
+            let first = first.apply(gate)?;
+            let first = first.apply(&self.per_layer_act)?;
+            let first = first.broadcast_mul(per_layer_input)?;
+            // proj: [..., hidden_per_layer] -> [..., hidden]
+            let first = first.apply(proj)?;
+            let first = norm.forward(&first)?;
+            // corrected[1:] += first  (broadcast across non-active streams)
+            // We do this by constructing a delta tensor of shape
+            // [num_inputs, B, T, H] where index altup_active_idx is zeros
+            // and the others are `first`. Then `corrected += delta`.
+            let n = altup.altup_num_inputs;
+            let mut slices: Vec<Tensor> = Vec::with_capacity(n);
+            for i in 0..n {
+                if i == altup.altup_active_idx {
+                    slices.push(first.zeros_like()?);
+                } else {
+                    slices.push(first.clone());
+                }
+            }
+            let delta = Tensor::stack(&slices, 0)?;
+            corrected = (corrected + delta)?;
+        }
+
+        Ok(corrected)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -600,6 +913,40 @@ impl PerLayerEmbedding {
     }
 }
 
+// ── AltUp magnitude rescale helpers ────────────────────────────────────────
+
+/// Per-token L2 magnitude `sqrt(mean(x**2, dim=-1, keepdim=True))`.
+/// Returns a `[..., 1]` tensor in f32 (the magnitude is always computed
+/// in f32 to avoid bf16 underflow before the rescale divide).
+fn magnitude_per_token(x: &Tensor) -> Result<Tensor> {
+    let original_dtype = x.dtype();
+    let x32 = x.to_dtype(DType::F32)?;
+    let sq = x32.sqr()?;
+    let mean = sq.mean_keepdim(D::Minus1)?;
+    let mag = mean.sqrt()?;
+    if original_dtype == DType::F32 {
+        Ok(mag)
+    } else {
+        // Magnitude stays in f32 — the consumer divides another f32
+        // through it, so we don't bother converting back.
+        Ok(mag)
+    }
+}
+
+/// Rescale `x` so its per-token L2 magnitude matches `target_magnitude`.
+/// Both tensors stay in `x`'s dtype, with the divide done in f32 for
+/// numerical stability.
+fn rescale_to_magnitude(x: &Tensor, target_magnitude: &Tensor) -> Result<Tensor> {
+    let original_dtype = x.dtype();
+    let x32 = x.to_dtype(DType::F32)?;
+    let new_mag = magnitude_per_token(&x32)?;
+    // Avoid divide-by-zero with a small floor.
+    let new_mag_clamped = new_mag.maximum(&Tensor::new(1e-12_f32, x.device())?.broadcast_as(new_mag.shape())?)?;
+    let scale = target_magnitude.broadcast_div(&new_mag_clamped)?;
+    let scaled = x32.broadcast_mul(&scale)?;
+    scaled.to_dtype(original_dtype)
+}
+
 // ── TextModel ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -616,6 +963,16 @@ pub struct TextModel {
     dtype: DType,
     hidden_size: usize,
     sliding_window: usize,
+    /// AltUp expand projections — `num_altup_inputs - 1` Linears that
+    /// derive the non-active starting hidden states from the main
+    /// `inputs_embeds`. `None` when AltUp isn't wired.
+    altup_projections: Option<Vec<Linear>>,
+    /// AltUp consolidation projections used at the very end of the
+    /// decoder stack to merge the parallel streams back into a single
+    /// `[B, T, hidden]` tensor.
+    altup_unembed_projections: Option<Vec<Linear>>,
+    altup_num_inputs: usize,
+    altup_active_idx: usize,
 }
 
 impl TextModel {
@@ -663,6 +1020,34 @@ impl TextModel {
         } else {
             None
         };
+
+        // AltUp expand / consolidate projections live at the
+        // `Gemma3nTextModel` level (HF). Construct only when AltUp is
+        // wired (num_inputs > 1). Tensor names: `altup_projections.{i}`
+        // and `altup_unembed_projections.{i}` for `i in 0..num_inputs-1`.
+        let (altup_projections, altup_unembed_projections) = if cfg.altup_num_inputs > 1 {
+            let n_extra = cfg.altup_num_inputs - 1;
+            let vb_proj = vb_m.pp("altup_projections");
+            let vb_unproj = vb_m.pp("altup_unembed_projections");
+            let mut projs = Vec::with_capacity(n_extra);
+            let mut unprojs = Vec::with_capacity(n_extra);
+            for i in 0..n_extra {
+                projs.push(candle_nn::linear_no_bias(
+                    cfg.hidden_size,
+                    cfg.hidden_size,
+                    vb_proj.pp(i),
+                )?);
+                unprojs.push(candle_nn::linear_no_bias(
+                    cfg.hidden_size,
+                    cfg.hidden_size,
+                    vb_unproj.pp(i),
+                )?);
+            }
+            (Some(projs), Some(unprojs))
+        } else {
+            (None, None)
+        };
+
         Ok(Self {
             embed_tokens,
             per_layer_embedding,
@@ -674,6 +1059,10 @@ impl TextModel {
             dtype: vb.dtype(),
             hidden_size: cfg.hidden_size,
             sliding_window: cfg.sliding_window,
+            altup_projections,
+            altup_unembed_projections,
+            altup_num_inputs: cfg.altup_num_inputs,
+            altup_active_idx: cfg.altup_active_idx,
         })
     }
 
@@ -737,27 +1126,14 @@ impl TextModel {
         batch_size: usize,
         seq_len: usize,
     ) -> Result<Tensor> {
-        let (attention_mask, sliding_attention_mask) =
-            self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
-
-        let mut xs = xs.clone();
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let per_layer_slice = match per_layer_inputs {
-                Some(table) => Some(table.narrow(2, layer_idx, 1)?.squeeze(2)?),
-                None => None,
-            };
-            xs = layer.forward(
-                &xs,
-                attention_mask.as_ref(),
-                sliding_attention_mask.as_ref(),
-                seqlen_offset,
-                per_layer_slice.as_ref(),
-            )?
-        }
-        let logits = xs
-            .narrow(1, seq_len - 1, 1)?
-            .apply(&self.norm)?
-            .apply(&self.lm_head)?;
+        let hidden = self.forward_embeds_hidden_with_per_layer(
+            xs,
+            per_layer_inputs,
+            seqlen_offset,
+            batch_size,
+            seq_len,
+        )?;
+        let logits = hidden.apply(&self.lm_head)?;
         match self.final_logit_softcapping {
             None => Ok(logits),
             Some(sc) => Ok(((logits / sc)?.tanh()? * sc)?),
@@ -791,21 +1167,71 @@ impl TextModel {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
 
-        let mut xs = xs.clone();
+        // ── AltUp expand ────────────────────────────────────────────
+        // When AltUp is wired (num_inputs > 1) we lift the [B, T, H]
+        // input into a [num_inputs, B, T, H] stack: the active stream is
+        // the original embeds, the others are produced by altup_projections
+        // and then magnitude-rescaled to match the active's per-token
+        // L2 magnitude (mirrors HF Gemma3nTextModel.forward).
+        let (mut current, altup_active) = if let Some(projs) = &self.altup_projections {
+            let target_mag = magnitude_per_token(xs)?;
+            let mut streams: Vec<Tensor> = Vec::with_capacity(self.altup_num_inputs);
+            for i in 0..self.altup_num_inputs {
+                if i == self.altup_active_idx {
+                    streams.push(xs.clone());
+                    continue;
+                }
+                let proj_idx = if i < self.altup_active_idx { i } else { i - 1 };
+                let projected = xs.apply(&projs[proj_idx])?;
+                let rescaled = rescale_to_magnitude(&projected, &target_mag)?;
+                streams.push(rescaled);
+            }
+            let stacked = Tensor::stack(&streams, 0)?;
+            (stacked, true)
+        } else {
+            (xs.clone(), false)
+        };
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let per_layer_slice = match per_layer_inputs {
                 Some(table) => Some(table.narrow(2, layer_idx, 1)?.squeeze(2)?),
                 None => None,
             };
-            xs = layer.forward(
-                &xs,
+            current = layer.forward(
+                &current,
                 attention_mask.as_ref(),
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
                 per_layer_slice.as_ref(),
             )?
         }
-        xs.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
+
+        // ── AltUp consolidate ──────────────────────────────────────
+        let final_hidden = if altup_active {
+            let unprojs = self
+                .altup_unembed_projections
+                .as_ref()
+                .expect("altup_projections set without altup_unembed_projections");
+            let active = current.i(self.altup_active_idx)?;
+            let target_mag = magnitude_per_token(&active)?;
+            let mut streams: Vec<Tensor> = Vec::with_capacity(self.altup_num_inputs);
+            for i in 0..self.altup_num_inputs {
+                if i == self.altup_active_idx {
+                    streams.push(active.clone());
+                    continue;
+                }
+                let proj_idx = if i < self.altup_active_idx { i } else { i - 1 };
+                let projected = current.i(i)?.apply(&unprojs[proj_idx])?;
+                let rescaled = rescale_to_magnitude(&projected, &target_mag)?;
+                streams.push(rescaled);
+            }
+            let stacked = Tensor::stack(&streams, 0)?;
+            stacked.mean(0)?
+        } else {
+            current
+        };
+
+        final_hidden.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
     }
 
     /// Compute the Gemma 3n per-layer-input table once for a given

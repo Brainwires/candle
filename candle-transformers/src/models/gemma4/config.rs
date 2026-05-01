@@ -46,6 +46,22 @@ fn default_global_head_dim() -> usize {
 fn default_use_flash_attn() -> bool {
     false
 }
+// ── AltUp / LAuReL defaults (Gemma 3n) ──────────────────────────────────────
+fn default_altup_num_inputs() -> usize {
+    4
+}
+fn default_altup_active_idx() -> usize {
+    0
+}
+fn default_altup_correct_scale() -> bool {
+    true
+}
+fn default_altup_coef_clip() -> Option<f64> {
+    Some(120.0)
+}
+fn default_laurel_rank() -> usize {
+    64
+}
 
 // ── Rope parameters ─────────────────────────────────────────────────────────
 
@@ -129,6 +145,35 @@ pub struct Gemma4TextConfig {
     /// top). `None` falls back to the main `vocab_size`.
     #[serde(default)]
     pub vocab_size_per_layer_input: Option<usize>,
+
+    // ── AltUp (Alternating Updates) ─────────────────────────────────────
+    /// Number of parallel hidden streams Gemma 3n maintains through the
+    /// decoder. Each layer runs predict / activate / correct over
+    /// `altup_num_inputs` copies of the hidden state.
+    #[serde(default = "default_altup_num_inputs")]
+    pub altup_num_inputs: usize,
+    /// Index into the AltUp stack that carries the "primary" prediction —
+    /// the one passed through input_layernorm + attention + MLP every
+    /// layer. The other streams are corrected based on the primary's
+    /// activated output.
+    #[serde(default = "default_altup_active_idx")]
+    pub altup_active_idx: usize,
+    /// When `true` (the trained default for Gemma 3n) the corrected
+    /// active prediction is multiplied by a learnable per-feature scale
+    /// before being fed into the per-layer-input gate.
+    #[serde(default = "default_altup_correct_scale")]
+    pub altup_correct_scale: bool,
+    /// During training, AltUp clamps `prediction_coefs` and
+    /// `correction_coefs` to `[-altup_coef_clip, +altup_coef_clip]`.
+    /// At inference this is informational only (no clamp on read).
+    #[serde(default = "default_altup_coef_clip")]
+    pub altup_coef_clip: Option<f64>,
+
+    // ── LAuReL (Learned Augmented Residual Layer) ───────────────────────
+    /// Rank of the low-rank residual augmentation applied alongside the
+    /// attention output (mirrors HF `Gemma3nTextLaurelBlock`).
+    #[serde(default = "default_laurel_rank")]
+    pub laurel_rank: usize,
 }
 
 impl Gemma4TextConfig {
