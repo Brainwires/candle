@@ -2949,6 +2949,32 @@ impl BackendStorage for CpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // gemm 0.19 has no `gemm-bf16` specialization, so the generic
+        // `Map2` path rejects bf16 with "unsupported dtype BF16 for op
+        // matmul". For the chat-pwa Gemma4 mixed-device flow we hit this
+        // every token at `lm_head` (the embed_tokens / lm_head weight is
+        // pinned bf16 on CPU). Promote both operands to f32, run f32
+        // gemm, demote the result.
+        //
+        // Memory cost: ~2× the operand size in scratch. For lm_head's
+        // [vocab × hidden] weight that's a one-shot 1.6 GB spike; if it
+        // becomes a problem we can either cache an f32 copy at load time
+        // or hand-roll a streaming bf16 matmul with f32 accumulation.
+        if let (CpuStorage::BF16(_), CpuStorage::BF16(_)) = (self, rhs) {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            // After `to_dtype` both buffers are contiguous starting at
+            // offset 0, so build matching contiguous layouts for the
+            // gemm call. The shapes are unchanged.
+            let lhs_l_f32 = Layout::contiguous(lhs_l.shape());
+            let rhs_l_f32 = Layout::contiguous(rhs_l.shape());
+            let out_f32 = MatMul(bmnk).map(&lhs_f32, &lhs_l_f32, &rhs_f32, &rhs_l_f32)?;
+            // Output is contiguous (b, m, n) f32; convert back to bf16.
+            let (b, m, n, _) = bmnk;
+            let out_shape = Shape::from((b, m, n));
+            let out_l = Layout::contiguous(&out_shape);
+            return out_f32.to_dtype(&out_l, DType::BF16);
+        }
         MatMul(bmnk).map(self, lhs_l, rhs, rhs_l)
     }
 
