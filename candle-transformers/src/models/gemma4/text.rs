@@ -675,13 +675,16 @@ impl DecoderLayer {
         // input gate when the config carries the corresponding fields.
         // For pure Gemma 3 / Gemma 4 (without AltUp), the layer falls
         // back to the classic pre-norm + attn + post-norm + ffw flow.
-        let has_altup = cfg.altup_num_inputs > 1;
+        // Each module is also gated by an explicit `disable_*` flag so
+        // numeric regressions in the new modules can be bisected at
+        // runtime without rebuilding.
+        let has_altup = cfg.altup_num_inputs > 1 && !cfg.disable_altup;
         let altup = if has_altup {
             Some(AltUp::new(cfg, vb.pp("altup"))?)
         } else {
             None
         };
-        let laurel = if cfg.laurel_rank > 0 {
+        let laurel = if cfg.laurel_rank > 0 && !cfg.disable_laurel {
             // The LaurelBlock weights are present in Gemma 3n
             // checkpoints; if construction fails (e.g. weights missing
             // for a non-3n config) we fall back to no-LAuReL.
@@ -689,26 +692,27 @@ impl DecoderLayer {
         } else {
             None
         };
-        let per_layer_input_gate = if let Some(hidden_per_layer) = cfg.hidden_size_per_layer_input
-        {
+        let ple_gate_enabled =
+            cfg.hidden_size_per_layer_input.is_some() && !cfg.disable_per_layer_input_gate;
+        let per_layer_input_gate = if ple_gate_enabled {
             Some(candle_nn::linear_no_bias(
                 cfg.hidden_size,
-                hidden_per_layer,
+                cfg.hidden_size_per_layer_input.unwrap(),
                 vb.pp("per_layer_input_gate"),
             )?)
         } else {
             None
         };
-        let per_layer_projection = if let Some(hidden_per_layer) = cfg.hidden_size_per_layer_input {
+        let per_layer_projection = if ple_gate_enabled {
             Some(candle_nn::linear_no_bias(
-                hidden_per_layer,
+                cfg.hidden_size_per_layer_input.unwrap(),
                 cfg.hidden_size,
                 vb.pp("per_layer_projection"),
             )?)
         } else {
             None
         };
-        let post_per_layer_input_norm = if cfg.hidden_size_per_layer_input.is_some() {
+        let post_per_layer_input_norm = if ple_gate_enabled {
             Some(RmsNorm::new(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
@@ -1107,9 +1111,12 @@ impl TextModel {
 
         // AltUp expand / consolidate projections live at the
         // `Gemma3nTextModel` level (HF). Construct only when AltUp is
-        // wired (num_inputs > 1). Tensor names: `altup_projections.{i}`
-        // and `altup_unembed_projections.{i}` for `i in 0..num_inputs-1`.
-        let (altup_projections, altup_unembed_projections) = if cfg.altup_num_inputs > 1 {
+        // wired (num_inputs > 1) AND the bisection kill-switch is off.
+        // Tensor names: `altup_projections.{i}` and
+        // `altup_unembed_projections.{i}` for `i in 0..num_inputs-1`.
+        let (altup_projections, altup_unembed_projections) = if cfg.altup_num_inputs > 1
+            && !cfg.disable_altup
+        {
             let n_extra = cfg.altup_num_inputs - 1;
             let vb_proj = vb_m.pp("altup_projections");
             let vb_unproj = vb_m.pp("altup_unembed_projections");

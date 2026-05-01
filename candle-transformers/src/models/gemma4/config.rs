@@ -183,6 +183,23 @@ pub struct Gemma4TextConfig {
     /// Vec length must equal `num_hidden_layers` when set.
     #[serde(default)]
     pub activation_sparsity_pattern: Option<Vec<f64>>,
+
+    // ── Bisection kill-switches (debugging) ─────────────────────────────
+    /// When `true`, force `altup_num_inputs = 1` semantics regardless of
+    /// the loaded weights — the decoder collapses to its classic single-
+    /// stream forward (Gemma 3 shape). `altup_projections` and
+    /// `altup_unembed_projections` are also skipped. Used to bisect
+    /// numeric regressions in the AltUp pipeline without rebuilding.
+    #[serde(default)]
+    pub disable_altup: bool,
+    /// When `true`, the LAuReL low-rank residual is omitted at every
+    /// layer.
+    #[serde(default)]
+    pub disable_laurel: bool,
+    /// When `true`, the per-layer-input gate inside the AltUp tail is
+    /// omitted — `corrected[1:] += first` becomes `corrected[1:] += 0`.
+    #[serde(default)]
+    pub disable_per_layer_input_gate: bool,
 }
 
 impl Gemma4TextConfig {
