@@ -77,6 +77,15 @@ pub struct Gemma4TextConfig {
     pub hidden_activation: Activation,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    /// Optional per-layer intermediate_size override. When present, layer
+    /// `i` uses `intermediate_sizes[i]` for its MLP gate/up/down
+    /// projections; otherwise the scalar `intermediate_size` applies to
+    /// every layer. Gemma4-E2B (Gemma 3n) ships with elastic MLP widths
+    /// — some layers are 6144-wide, others 12288-wide — so loading those
+    /// weights without shape mismatches requires the per-layer table.
+    /// Vec length must equal `num_hidden_layers` when set.
+    #[serde(default)]
+    pub intermediate_sizes: Option<Vec<usize>>,
     #[serde(default = "default_num_attention_heads")]
     pub num_attention_heads: usize,
     pub num_hidden_layers: usize,
@@ -138,6 +147,15 @@ impl Gemma4TextConfig {
             .get(layer_idx)
             .map(|s| s == "sliding_attention")
             .unwrap_or(false)
+    }
+
+    /// Resolve the MLP intermediate_size for a specific decoder layer,
+    /// preferring the per-layer override (`intermediate_sizes`) when set.
+    pub fn intermediate_size_at(&self, layer_idx: usize) -> usize {
+        self.intermediate_sizes
+            .as_ref()
+            .and_then(|v| v.get(layer_idx).copied())
+            .unwrap_or(self.intermediate_size)
     }
 }
 

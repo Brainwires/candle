@@ -403,7 +403,7 @@ impl DecoderLayer {
         )?;
         let mlp = MLP::new(
             cfg.hidden_size,
-            cfg.intermediate_size,
+            cfg.intermediate_size_at(layer_idx),
             cfg.hidden_activation,
             false,
             vb.pp("mlp"),
