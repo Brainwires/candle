@@ -217,6 +217,11 @@ struct Attention {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
+    /// Attention pre-softmax scaling uses `1/√query_pre_attn_scalar`. For
+    /// Gemma 3n E2B this equals `head_dim` (both 256), but configurations
+    /// where global layers carry a larger `head_dim` keep the trained
+    /// scale by reading from the dedicated config field.
+    query_pre_attn_scalar: usize,
     rms_norm_eps: f64,
     is_sliding: bool,
     rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
@@ -279,6 +284,7 @@ impl Attention {
             num_kv_heads,
             num_kv_groups,
             head_dim,
+            query_pre_attn_scalar: cfg.query_pre_attn_scalar,
             rms_norm_eps: cfg.rms_norm_eps,
             is_sliding,
             rotary_emb_global,
@@ -344,10 +350,13 @@ impl Attention {
             let q = q.transpose(1, 2)?;
             let k = k.transpose(1, 2)?;
             let v = v.transpose(1, 2)?;
-            let scale = 1f32 / (self.head_dim as f32).sqrt();
+            // Gemma 3 / 3n scale by `query_pre_attn_scalar`, not `head_dim` —
+            // they're equal for E2B (both 256) but diverge in variants where
+            // global layers carry a larger head_dim.
+            let scale = 1f32 / (self.query_pre_attn_scalar as f32).sqrt();
             flash_attn(&q, &k, &v, scale, mask.is_some())?.transpose(1, 2)?
         } else {
-            let scale = 1f64 / f64::sqrt(self.head_dim as f64);
+            let scale = 1f64 / f64::sqrt(self.query_pre_attn_scalar as f64);
             let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
 
             let attn_weights = match mask {
