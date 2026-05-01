@@ -34,6 +34,7 @@ use super::super::storage::WgpuStorage;
 
 const MATMUL_F32_WGSL: &str = include_str!("../kernels/matmul.wgsl");
 const MATMUL_F16_WGSL: &str = include_str!("../kernels/matmul_f16.wgsl");
+const MATMUL_BF16_WGSL: &str = include_str!("../kernels/matmul_bf16.wgsl");
 
 const TILE: u32 = 16;
 
@@ -204,6 +205,7 @@ pub(crate) fn matmul(
     let plan = plan(bmnk, lhs_layout, rhs_layout)?;
     match lhs.dtype {
         DType::F32 => dispatch(lhs, rhs, &plan, MatmulVariant::F32),
+        DType::BF16 => dispatch(lhs, rhs, &plan, MatmulVariant::BF16),
         DType::F16 => {
             if !lhs.device.supports_shader_f16() {
                 return Err(crate::Error::Msg(
@@ -258,6 +260,7 @@ const fn wgsl_frontend_supports_f16() -> bool {
 enum MatmulVariant {
     F32,
     F16,
+    BF16,
 }
 
 impl MatmulVariant {
@@ -265,25 +268,36 @@ impl MatmulVariant {
         match self {
             Self::F32 => "matmul:f32",
             Self::F16 => "matmul:f16",
+            Self::BF16 => "matmul:bf16",
         }
     }
     fn wgsl(self) -> &'static str {
         match self {
             Self::F32 => MATMUL_F32_WGSL,
             Self::F16 => MATMUL_F16_WGSL,
+            Self::BF16 => MATMUL_BF16_WGSL,
         }
     }
     fn elem_bytes(self) -> u64 {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
+            Self::BF16 => 2,
         }
     }
     fn dtype(self) -> DType {
         match self {
             Self::F32 => DType::F32,
             Self::F16 => DType::F16,
+            Self::BF16 => DType::BF16,
         }
+    }
+    /// BF16 output uses `atomic<u32>` writes (one bf16 per thread, two
+    /// threads in a row may target halves of the same u32). The host must
+    /// zero the buffer up-front so the OR-merge produces only the bits
+    /// each thread actually wrote.
+    fn needs_zero_init_output(self) -> bool {
+        matches!(self, Self::BF16)
     }
 }
 
@@ -309,14 +323,23 @@ fn dispatch(
     let align = wgpu::COPY_BUFFER_ALIGNMENT;
     let out_size = raw_size.div_ceil(align) * align;
 
+    let zero_init = variant.needs_zero_init_output();
     let out_buffer = device.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("wgpu-matmul-out"),
         size: out_size,
         usage: wgpu::BufferUsages::STORAGE
             | wgpu::BufferUsages::COPY_SRC
             | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
+        mapped_at_creation: zero_init,
     });
+    if zero_init {
+        // Zero the buffer so atomicOr writes start from a clean slate.
+        {
+            let mut view = out_buffer.slice(..).get_mapped_range_mut();
+            view.slice(..).fill(0);
+        }
+        out_buffer.unmap();
+    }
 
     // Uniform buffer with the meta struct.
     let meta = MatmulMeta {
