@@ -1024,13 +1024,31 @@ fn magnitude_per_token(x: &Tensor) -> Result<Tensor> {
 /// Rescale `x` so its per-token L2 magnitude matches `target_magnitude`.
 /// Both tensors stay in `x`'s dtype, with the divide done in f32 for
 /// numerical stability.
+///
+/// Hardened against the NaN-via-overflow path that the previous
+/// implementation hit on Gemma 3n loads:
+///
+/// 1. The eps floor is folded *inside* the sqrt argument as
+///    `sqrt(mean(x²) + eps²)` so `denom >= eps` even when `mean(x²)`
+///    underflows to zero in f32 (versus the previous post-sqrt
+///    `max(new_mag, 1e-12)` which left a path where the divisor could
+///    legitimately be `1e-12` and the resulting scale would explode by
+///    ~1e12).
+/// 2. The resulting `scale` is clamped to `[0, 65504]` (just above
+///    bf16's max-finite, leaving headroom in f32) so even a degenerate
+///    near-zero stream can't produce a multiply that overflows the
+///    forward dtype on the cast back.
 fn rescale_to_magnitude(x: &Tensor, target_magnitude: &Tensor) -> Result<Tensor> {
+    const EPS: f64 = 1e-6;
     let original_dtype = x.dtype();
     let x32 = x.to_dtype(DType::F32)?;
-    let new_mag = magnitude_per_token(&x32)?;
-    // Avoid divide-by-zero with a small floor.
-    let new_mag_clamped = new_mag.maximum(&Tensor::new(1e-12_f32, x.device())?.broadcast_as(new_mag.shape())?)?;
-    let scale = target_magnitude.broadcast_div(&new_mag_clamped)?;
+    let mean_sq = x32.sqr()?.mean_keepdim(D::Minus1)?;
+    let denom = (mean_sq + (EPS * EPS))?.sqrt()?;
+    let scale = target_magnitude.broadcast_div(&denom)?;
+    // Cap the scale below f32 overflow + bf16 round-trip. 65504 is the
+    // largest finite bf16 — even if the scale lands exactly there, the
+    // subsequent multiply produces a finite f32 result.
+    let scale = scale.clamp(0f32, 65504.0)?;
     let scaled = x32.broadcast_mul(&scale)?;
     scaled.to_dtype(original_dtype)
 }
