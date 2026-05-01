@@ -900,13 +900,23 @@ fn prepare_decoder_attention_mask(
 #[derive(Debug, Clone)]
 struct PerLayerEmbedding {
     /// Looks up `[B, T] -> [B, T, num_layers * hidden_per_layer]`.
-    embed_tokens_per_layer: candle_nn::Embedding,
+    /// Optional because the canonical Gemma 3n / Gemma 4 weight is huge
+    /// (vocab × num_layers × hidden_per_layer = several GB) and may be
+    /// skipped at load time on memory-constrained targets (wasm32). When
+    /// `None` the table contribution is implicitly zero — the merge
+    /// becomes `per_layer_input = per_layer_proj * rsqrt(2)`. That's an
+    /// approximation of the trained behavior (we lose the per-token
+    /// PLE signal) but produces coherent forward output without
+    /// blowing the runtime memory ceiling.
+    embed_tokens_per_layer: Option<candle_nn::Embedding>,
     /// Projects the main `inputs_embeds` `[B, T, hidden_size]` into the
     /// same `num_layers * hidden_per_layer` space so the two signals
     /// can be summed.
     per_layer_model_projection: Linear,
-    /// RMSNorm applied to the projection before it's merged with the
-    /// embed-table lookup.
+    /// RMSNorm applied to each per-layer slice (`hidden_per_layer`-wide)
+    /// of the reshaped projection. Per HF the norm acts on the LAST
+    /// dim of `[B, T, num_layers, hidden_per_layer]`, so its weight is
+    /// `[hidden_per_layer]`, not `[num_layers * hidden_per_layer]`.
     per_layer_projection_norm: RmsNorm,
     /// Buffer scale = `1 / √hidden_size` (HF computes this as
     /// `hidden_size ** -0.5`). Multiplied into the projection so the
@@ -929,15 +939,24 @@ impl PerLayerEmbedding {
             ))?;
         let vocab_per_layer = cfg.vocab_size_per_layer_input.unwrap_or(cfg.vocab_size);
         let total = cfg.num_hidden_layers * hidden_per_layer;
-        let embed_tokens_per_layer = candle_nn::embedding(
-            vocab_per_layer,
-            total,
-            vb.pp("embed_tokens_per_layer"),
-        )?;
+        // The embedding table is multiple GB on E2B; only construct it
+        // when the VarBuilder backend actually has the tensor in scope.
+        // Callers (e.g. chat-pwa) may opt to skip loading it on
+        // memory-constrained targets — in which case we silently fall
+        // back to the projection-only merge.
+        let embed_tokens_per_layer = if vb.contains_tensor("embed_tokens_per_layer.weight") {
+            Some(candle_nn::embedding(
+                vocab_per_layer,
+                total,
+                vb.pp("embed_tokens_per_layer"),
+            )?)
+        } else {
+            None
+        };
         let per_layer_model_projection =
             candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("per_layer_model_projection"))?;
         let per_layer_projection_norm = RmsNorm::new(
-            total,
+            hidden_per_layer,
             cfg.rms_norm_eps,
             vb.pp("per_layer_projection_norm"),
         )?;
@@ -957,22 +976,24 @@ impl PerLayerEmbedding {
     /// dtype as `inputs_embeds`.
     fn forward(&self, input_ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
         let (b, t) = input_ids.dims2()?;
-        // `embed_tokens_per_layer(ids)` -> [B, T, L*H_per]
-        let table = self.embed_tokens_per_layer.forward(input_ids)?;
-        let table = table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
 
-        // Project inputs_embeds and reshape to match.
+        // Project inputs_embeds, reshape to (B, T, num_layers, H_per),
+        // scale and norm — applied per-slice along the last axis.
         let proj = inputs_embeds.apply(&self.per_layer_model_projection)?;
-        // Multiply by 1/√hidden_size before the RMSNorm so the trained
-        // scale lines up with HF.
         let proj = (proj * self.per_layer_projection_scale)?;
-        let proj = proj.apply(&self.per_layer_projection_norm)?;
-        let proj =
-            proj.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+        let proj = proj.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+        let proj = self.per_layer_projection_norm.forward(&proj)?;
 
-        // (proj + table) * rsqrt(2)
-        let merged = (proj.broadcast_add(&table)? * self.per_layer_input_scale)?;
-        Ok(merged.contiguous()?)
+        let merged = match &self.embed_tokens_per_layer {
+            Some(embed) => {
+                let table = embed.forward(input_ids)?;
+                let table =
+                    table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+                (proj.broadcast_add(&table)? * self.per_layer_input_scale)?
+            }
+            None => (proj * self.per_layer_input_scale)?,
+        };
+        merged.contiguous()
     }
 }
 
