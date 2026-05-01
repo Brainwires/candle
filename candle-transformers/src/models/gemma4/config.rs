@@ -174,6 +174,15 @@ pub struct Gemma4TextConfig {
     /// attention output (mirrors HF `Gemma3nTextLaurelBlock`).
     #[serde(default = "default_laurel_rank")]
     pub laurel_rank: usize,
+
+    // ── Activation sparsity (Gemma 3n) ──────────────────────────────────
+    /// Per-layer sparsity ratio applied to `gate_proj` *before* the
+    /// activation function. Sparsity 0.95 zeros out the bottom 95% of
+    /// the per-token gate values via a Gaussian top-K threshold; 0.0
+    /// disables sparsity for that layer. None ⇒ disabled for all layers.
+    /// Vec length must equal `num_hidden_layers` when set.
+    #[serde(default)]
+    pub activation_sparsity_pattern: Option<Vec<f64>>,
 }
 
 impl Gemma4TextConfig {
@@ -215,6 +224,16 @@ impl Gemma4TextConfig {
             .as_ref()
             .and_then(|v| v.get(layer_idx).copied())
             .unwrap_or(self.intermediate_size)
+    }
+
+    /// Resolve the activation-sparsity ratio for a given decoder layer.
+    /// Returns `0.0` (no sparsity) when the model wasn't trained with
+    /// the per-layer pattern.
+    pub fn activation_sparsity_at(&self, layer_idx: usize) -> f64 {
+        self.activation_sparsity_pattern
+            .as_ref()
+            .and_then(|v| v.get(layer_idx).copied())
+            .unwrap_or(0.0)
     }
 }
 

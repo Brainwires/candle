@@ -153,28 +153,90 @@ struct MLP {
     up_proj: Linear,
     down_proj: Linear,
     act_fn: Activation,
+    /// Pre-activation Gaussian-topk threshold offset
+    /// `icdf_normal(sparsity)`. `0.0` disables sparsity for this layer.
+    /// Computed once at construction from the layer's
+    /// `cfg.activation_sparsity_at(layer_idx)`.
+    sparsity_threshold_z: f64,
 }
 
 impl MLP {
-    fn new(hidden_size: usize, intermediate_size: usize, act: Activation, bias: bool, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        hidden_size: usize,
+        intermediate_size: usize,
+        act: Activation,
+        bias: bool,
+        sparsity: f64,
+        vb: VarBuilder,
+    ) -> Result<Self> {
         let gate_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("gate_proj"))?;
         let up_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("up_proj"))?;
         let down_proj = linear_bias(intermediate_size, hidden_size, bias, vb.pp("down_proj"))?;
+        let sparsity_threshold_z = if sparsity > 0.0 && sparsity < 1.0 {
+            // icdf of standard normal at p = sparsity. Using
+            // sqrt(2) * erfinv(2*sparsity - 1).
+            std::f64::consts::SQRT_2 * erfinv_approx(2.0 * sparsity - 1.0)
+        } else {
+            0.0
+        };
         Ok(Self {
             gate_proj,
             up_proj,
             down_proj,
             act_fn: act,
+            sparsity_threshold_z,
         })
+    }
+
+    /// `gate(x)` with optional Gaussian-topk sparsity applied before the
+    /// activation. Equivalent to HF `Gemma3nTextMLP.gaussian_topk` + the
+    /// surrounding gate/up/down flow.
+    fn forward_inner(&self, xs: &Tensor) -> Result<Tensor> {
+        let mut gate = xs.apply(&self.gate_proj)?;
+        if self.sparsity_threshold_z != 0.0 {
+            // threshold = mean + std * z, applied per-token along the
+            // intermediate axis. mean / std computed in f32 for stability.
+            let original_dtype = gate.dtype();
+            let gate_f32 = gate.to_dtype(DType::F32)?;
+            let mean = gate_f32.mean_keepdim(D::Minus1)?;
+            let var = gate_f32
+                .broadcast_sub(&mean)?
+                .sqr()?
+                .mean_keepdim(D::Minus1)?;
+            let std = var.sqrt()?;
+            let threshold = (mean + (std * self.sparsity_threshold_z)?)?;
+            let sparse = gate_f32.broadcast_sub(&threshold)?;
+            // ReLU
+            let zero = Tensor::zeros_like(&sparse)?;
+            let sparse = sparse.maximum(&zero)?;
+            gate = sparse.to_dtype(original_dtype)?;
+        }
+        let lhs = gate.apply(&self.act_fn)?;
+        let rhs = xs.apply(&self.up_proj)?;
+        (lhs * rhs)?.apply(&self.down_proj)
     }
 }
 
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        self.forward_inner(xs)
     }
+}
+
+/// Cheap erfinv approximation accurate to ~5e-4 across [-1, 1]. Sufficient
+/// for AltUp's sparsity threshold which is itself a multiplicative factor
+/// applied to a noisy mean+std estimate. Source: Winitzki, "A handy
+/// approximation for the error function and its inverse" (2008).
+fn erfinv_approx(x: f64) -> f64 {
+    if x.abs() >= 1.0 {
+        return x.signum() * f64::INFINITY;
+    }
+    let a = 0.147;
+    let ln = (1.0 - x * x).ln();
+    let term1 = 2.0 / (std::f64::consts::PI * a) + ln / 2.0;
+    let term2 = ln / a;
+    let inner = (term1 * term1 - term2).sqrt() - term1;
+    x.signum() * inner.sqrt()
 }
 
 // ── Flash attention ─────────────────────────────────────────────────────────
@@ -588,6 +650,7 @@ impl DecoderLayer {
             cfg.intermediate_size_at(layer_idx),
             cfg.hidden_activation,
             false,
+            cfg.activation_sparsity_at(layer_idx),
             vb.pp("mlp"),
         )?;
         let input_layernorm =
