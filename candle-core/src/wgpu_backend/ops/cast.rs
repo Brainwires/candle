@@ -253,7 +253,8 @@ pub(crate) fn to_dtype(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(dispatch_groups, 1, 1);
+        let (gx, gy) = super::split_1d_dispatch(dispatch_groups);
+        pass.dispatch_workgroups(gx, gy, 1);
     }
     device.queue().submit(Some(encoder.finish()));
 

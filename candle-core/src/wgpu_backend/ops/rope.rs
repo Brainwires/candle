@@ -321,7 +321,9 @@ pub fn rope(
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        pass.dispatch_workgroups(n_pairs_u32.div_ceil(WORKGROUP_SIZE), 1, 1);
+        let total_groups = n_pairs_u32.div_ceil(WORKGROUP_SIZE);
+        let (gx, gy) = super::split_1d_dispatch(total_groups);
+        pass.dispatch_workgroups(gx, gy, 1);
     }
     device.queue().submit(Some(encoder.finish()));
 

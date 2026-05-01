@@ -36,8 +36,11 @@ struct RopeMeta {
 @group(0) @binding(4) var<storage, read_write> dst: array<__SCALAR_T__>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pair = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let pair = gid.x + gid.y * num_wg.x * 64u;
     if (pair >= params.n_pairs) {
         return;
     }

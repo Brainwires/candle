@@ -154,8 +154,10 @@ pub fn softmax_last_dim(src: &WgpuStorage, layout: &Layout) -> Result<(WgpuStora
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_group, &[]);
-        // One workgroup per row.
-        pass.dispatch_workgroups(n_rows as u32, 1, 1);
+        // One workgroup per row. 2-D split for row counts that exceed
+        // WebGPU's per-dim 65535 workgroup limit.
+        let (gx, gy) = super::split_1d_dispatch(n_rows as u32);
+        pass.dispatch_workgroups(gx, gy, 1);
     }
     device.queue().submit(Some(encoder.finish()));
 

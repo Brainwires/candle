@@ -32,8 +32,11 @@ fn f32_to_bf16_bits(x: f32) -> u32 {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let pair_idx = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let pair_idx = gid.x + gid.y * num_wg.x * 64u;
     let i = pair_idx * 2u;
     if i >= params.n_elements {
         return;

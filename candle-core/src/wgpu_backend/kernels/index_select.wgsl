@@ -26,8 +26,11 @@ struct IndexSelectMeta {
 @group(0) @binding(3) var<storage, read_write> out: array<__SCALAR_T__>;
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let idx = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    let idx = gid.x + gid.y * num_wg.x * 64u;
     if idx >= params.n_elements {
         return;
     }

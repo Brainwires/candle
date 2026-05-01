@@ -32,8 +32,11 @@ var<workgroup> shared_sum: array<__SCALAR_T__, 64>;
 fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
     @builtin(local_invocation_id) lid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
 ) {
-    let row = wg_id.x;
+    // 2-D row dispatch: row = wg_id.x + wg_id.y * num_wg.x. Lets us
+    // softmax over more than 65535 rows (e.g. long-context attention).
+    let row = wg_id.x + wg_id.y * num_wg.x;
     if row >= params.n_rows {
         return;
     }

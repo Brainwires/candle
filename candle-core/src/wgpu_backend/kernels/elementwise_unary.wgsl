@@ -81,8 +81,12 @@ fn op_apply(x: __SCALAR_T__) -> __SCALAR_T__ {
 }
 
 @compute @workgroup_size(64)
-fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+fn main(
+    @builtin(global_invocation_id) gid: vec3<u32>,
+    @builtin(num_workgroups) num_wg: vec3<u32>,
+) {
+    // 2-D dispatch: linear index walks x first, then y. WG_SIZE_X = 64u.
+    let i = gid.x + gid.y * num_wg.x * 64u;
     if (i >= params.n_elements) {
         return;
     }
