@@ -18,6 +18,7 @@ use vision::VisionTower;
 
 pub use audio::AudioModel;
 pub use config::{Gemma4AudioConfig, Gemma4TextConfig, Gemma4VisionConfig};
+pub use text::PerLayerEmbedTable;
 
 /// Full Gemma4 multimodal model.
 ///

@@ -1009,6 +1009,33 @@ fn prepare_decoder_attention_mask(
 // `[B, T, hidden_per_layer]` as a side-channel input. Mirrors HF's
 // `Gemma3nTextModel` lines ~2399–2430.
 
+/// Pluggable per-layer-embedding table lookup.
+///
+/// The default in-memory impl wraps `candle_nn::Embedding` and is what
+/// `PerLayerEmbedding::new` constructs when the safetensors file carries
+/// a sized-tractable PLE weight. Memory-constrained targets (wasm32) can
+/// implement this trait against a streaming source — e.g. an OPFS-backed
+/// random-access read of the original safetensors blob — and inject it
+/// via [`TextModel::set_per_layer_embed_table`].
+///
+/// `lookup` returns `[B, T, num_layers * hidden_per_layer]` (matching
+/// `candle_nn::Embedding::forward(input_ids)` for an embedding table of
+/// size `vocab × (num_layers × hidden_per_layer)`).
+pub trait PerLayerEmbedTable: std::fmt::Debug + Send + Sync {
+    fn lookup(&self, input_ids: &Tensor) -> Result<Tensor>;
+}
+
+/// In-memory wrapper around `candle_nn::Embedding`. Used by the default
+/// `PerLayerEmbedding::new` path when the table fits in scope.
+#[derive(Debug)]
+struct InMemoryPerLayerTable(candle_nn::Embedding);
+
+impl PerLayerEmbedTable for InMemoryPerLayerTable {
+    fn lookup(&self, input_ids: &Tensor) -> Result<Tensor> {
+        self.0.forward(input_ids)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PerLayerEmbedding {
     /// Looks up `[B, T] -> [B, T, num_layers * hidden_per_layer]`.
@@ -1020,7 +1047,10 @@ struct PerLayerEmbedding {
     /// approximation of the trained behavior (we lose the per-token
     /// PLE signal) but produces coherent forward output without
     /// blowing the runtime memory ceiling.
-    embed_tokens_per_layer: Option<candle_nn::Embedding>,
+    ///
+    /// `Arc<dyn>` so a host (e.g. chat-pwa) can swap in a streaming impl
+    /// after construction via [`TextModel::set_per_layer_embed_table`].
+    embed_tokens_per_layer: Option<Arc<dyn PerLayerEmbedTable>>,
     /// Projects the main `inputs_embeds` `[B, T, hidden_size]` into the
     /// same `num_layers * hidden_per_layer` space so the two signals
     /// can be summed.
@@ -1056,15 +1086,17 @@ impl PerLayerEmbedding {
         // Callers (e.g. chat-pwa) may opt to skip loading it on
         // memory-constrained targets — in which case we silently fall
         // back to the projection-only merge.
-        let embed_tokens_per_layer = if vb.contains_tensor("embed_tokens_per_layer.weight") {
-            Some(candle_nn::embedding(
-                vocab_per_layer,
-                total,
-                vb.pp("embed_tokens_per_layer"),
-            )?)
-        } else {
-            None
-        };
+        let embed_tokens_per_layer: Option<Arc<dyn PerLayerEmbedTable>> =
+            if vb.contains_tensor("embed_tokens_per_layer.weight") {
+                let embed = candle_nn::embedding(
+                    vocab_per_layer,
+                    total,
+                    vb.pp("embed_tokens_per_layer"),
+                )?;
+                Some(Arc::new(InMemoryPerLayerTable(embed)))
+            } else {
+                None
+            };
         let per_layer_model_projection =
             candle_nn::linear_no_bias(cfg.hidden_size, total, vb.pp("per_layer_model_projection"))?;
         let per_layer_projection_norm = RmsNorm::new(
@@ -1098,7 +1130,7 @@ impl PerLayerEmbedding {
 
         let merged = match &self.embed_tokens_per_layer {
             Some(embed) => {
-                let table = embed.forward(input_ids)?;
+                let table = embed.lookup(input_ids)?;
                 let table =
                     table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
                 (proj.broadcast_add(&table)? * self.per_layer_input_scale)?
@@ -1509,5 +1541,27 @@ impl TextModel {
         for layer in self.layers.iter_mut() {
             layer.clear_kv_cache()
         }
+    }
+
+    /// Inject a custom per-layer-embedding table after construction.
+    /// Used by hosts (chat-pwa) that skip the in-memory PLE weight at
+    /// load time and back it with a streaming source — typically OPFS
+    /// random-access reads against the original safetensors blob.
+    ///
+    /// Errors if the model wasn't built with PLE wired
+    /// (`hidden_size_per_layer_input` was `None` in the config).
+    pub fn set_per_layer_embed_table(
+        &mut self,
+        table: Arc<dyn PerLayerEmbedTable>,
+    ) -> Result<()> {
+        let ple = self.per_layer_embedding.as_mut().ok_or_else(|| {
+            candle::Error::Msg(
+                "TextModel was not constructed with PLE — \
+                 hidden_size_per_layer_input is None"
+                    .into(),
+            )
+        })?;
+        ple.embed_tokens_per_layer = Some(table);
+        Ok(())
     }
 }
