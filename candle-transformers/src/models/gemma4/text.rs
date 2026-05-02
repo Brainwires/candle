@@ -894,7 +894,17 @@ impl DecoderLayer {
         seqlen_offset: usize,
         per_layer_input: Option<&Tensor>,
         shared_kv_store: &mut SharedKvStore,
+        layer_idx: usize,
+        intra_hook: &mut Option<&mut dyn FnMut(usize, &str, &Tensor)>,
     ) -> Result<Tensor> {
+        macro_rules! checkpoint {
+            ($step:expr, $tensor:expr) => {
+                if let Some(hook) = intra_hook.as_deref_mut() {
+                    hook(layer_idx, $step, $tensor);
+                }
+            };
+        }
+
         let altup = match &self.altup {
             Some(a) => a,
             None => {
@@ -905,7 +915,9 @@ impl DecoderLayer {
                 //
                 // 1. Attention residual
                 let residual = xs;
+                checkpoint!("input", residual);
                 let h = self.input_layernorm.forward(xs)?;
+                checkpoint!("post_input_layernorm", &h);
                 let h = self.self_attn.forward(
                     &h,
                     attention_mask,
@@ -913,15 +925,22 @@ impl DecoderLayer {
                     seqlen_offset,
                     shared_kv_store,
                 )?;
+                checkpoint!("post_self_attn", &h);
                 let h = h.apply(&self.post_attention_layernorm)?;
+                checkpoint!("post_attn_layernorm", &h);
                 let h = (h + residual)?;
+                checkpoint!("post_attn_residual", &h);
 
                 // 2. MLP residual
                 let residual = h.clone();
                 let h = h.apply(&self.pre_feedforward_layernorm)?;
+                checkpoint!("post_pre_ff_layernorm", &h);
                 let h = h.apply(&self.mlp)?;
+                checkpoint!("post_mlp", &h);
                 let h = h.apply(&self.post_feedforward_layernorm)?;
+                checkpoint!("post_ff_layernorm", &h);
                 let h = (h + &residual)?;
+                checkpoint!("post_mlp_residual", &h);
 
                 // 3. Per-layer-input residual (Gemma 4 PLE side-channel).
                 // HF: `gate(h) → act → * per_layer_input → projection →
@@ -937,11 +956,18 @@ impl DecoderLayer {
                 ) {
                     let residual = h.clone();
                     let g = h.apply(gate)?;
+                    checkpoint!("ple/post_gate", &g);
                     let g = g.apply(&self.per_layer_act)?;
+                    checkpoint!("ple/post_act", &g);
                     let g = g.broadcast_mul(per_layer_input)?;
+                    checkpoint!("ple/post_mul", &g);
                     let g = g.apply(proj)?;
+                    checkpoint!("ple/post_proj", &g);
                     let g = norm.forward(&g)?;
-                    (g + residual)?
+                    checkpoint!("ple/post_norm", &g);
+                    let h = (g + residual)?;
+                    checkpoint!("post_ple_residual", &h);
+                    h
                 } else {
                     h
                 };
@@ -953,7 +979,9 @@ impl DecoderLayer {
                 // `abs_max=1232` observed on layer-0 in the chat-pwa
                 // diagnostic harness.
                 let h = if let Some(scalar) = &self.layer_scalar {
-                    h.broadcast_mul(scalar)?
+                    let h = h.broadcast_mul(scalar)?;
+                    checkpoint!("post_layer_scalar", &h);
+                    h
                 } else {
                     h
                 };
@@ -1528,6 +1556,40 @@ impl TextModel {
             batch_size,
             seq_len,
             Some(&mut hook),
+            None,
+        )
+    }
+
+    /// Same as `*_hooked` plus an *intra-layer* hook fired after every
+    /// internal checkpoint within `DecoderLayer::forward` (classic path
+    /// only). The intra hook signature is `(layer_idx, step_name, &state)`.
+    /// Step names: `input`, `post_input_layernorm`, `post_self_attn`,
+    /// `post_attn_layernorm`, `post_attn_residual`, `post_pre_ff_layernorm`,
+    /// `post_mlp`, `post_ff_layernorm`, `post_mlp_residual`,
+    /// `ple/post_gate`, `ple/post_act`, `ple/post_mul`, `ple/post_proj`,
+    /// `ple/post_norm`, `post_ple_residual`, `post_layer_scalar`.
+    ///
+    /// Diagnostic-only. The intra hook fires on EVERY layer; callers are
+    /// expected to filter on `layer_idx` if they only want certain
+    /// layers' intermediate states.
+    pub fn forward_embeds_hidden_with_intra_hook(
+        &mut self,
+        xs: &Tensor,
+        per_layer_inputs: Option<&Tensor>,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+        mut layer_hook: impl FnMut(usize, &Tensor),
+        mut intra_hook: impl FnMut(usize, &str, &Tensor),
+    ) -> Result<Tensor> {
+        self.forward_embeds_hidden_inner(
+            xs,
+            per_layer_inputs,
+            seqlen_offset,
+            batch_size,
+            seq_len,
+            Some(&mut layer_hook),
+            Some(&mut intra_hook),
         )
     }
 
@@ -1548,6 +1610,7 @@ impl TextModel {
             batch_size,
             seq_len,
             None,
+            None,
         )
     }
 
@@ -1559,6 +1622,7 @@ impl TextModel {
         batch_size: usize,
         seq_len: usize,
         mut hook: Option<&mut dyn FnMut(usize, &Tensor)>,
+        mut intra_hook: Option<&mut dyn FnMut(usize, &str, &Tensor)>,
     ) -> Result<Tensor> {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
@@ -1605,6 +1669,8 @@ impl TextModel {
                 seqlen_offset,
                 per_layer_slice.as_ref(),
                 &mut shared_kv_store,
+                layer_idx,
+                &mut intra_hook,
             )?;
             if let Some(h) = hook.as_mut() {
                 h(layer_idx, &current);
