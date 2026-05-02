@@ -740,6 +740,16 @@ struct DecoderLayer {
     /// `1/√2` constant for the (attn_gated + laurel_out) merge.
     inv_sqrt_2: f64,
     altup_correct_scale: bool,
+    /// Per-layer learned scalar applied to the layer output.
+    /// `Gemma4TextDecoderLayer` in HF: `register_buffer("layer_scalar",
+    /// torch.ones(1))` initialized to 1.0, trained per layer, and applied
+    /// as `hidden_states *= layer_scalar` as the final operation of
+    /// `forward()`. Without this multiply the residual stream is missing
+    /// a per-layer trained gain — empirically observed to send `abs_max`
+    /// over 1000 after just one layer on Gemma 4 E2B, then NaN at the
+    /// next softmax. `None` when the checkpoint doesn't carry this
+    /// tensor (e.g. non-Gemma-4 fallback paths).
+    layer_scalar: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -835,6 +845,13 @@ impl DecoderLayer {
             None
         };
 
+        // `layer_scalar` is a [1]-shaped per-layer learned gain stored in
+        // the safetensors as `layers.<i>.layer_scalar`. Optional —
+        // checkpoints without this tensor (older Gemma generations
+        // wrapped through the gemma4 path for shape compat) silently
+        // skip the multiply.
+        let layer_scalar = vb.get(1, "layer_scalar").ok();
+
         Ok(Self {
             self_attn,
             mlp,
@@ -851,6 +868,7 @@ impl DecoderLayer {
             per_layer_act: cfg.hidden_activation,
             inv_sqrt_2: (2.0_f64).powf(-0.5),
             altup_correct_scale: cfg.altup_correct_scale,
+            layer_scalar,
         })
     }
 
@@ -880,7 +898,12 @@ impl DecoderLayer {
         let altup = match &self.altup {
             Some(a) => a,
             None => {
-                // Classic path — no AltUp wiring.
+                // Classic / Gemma 4 path — no AltUp wiring. Mirrors
+                // `Gemma4TextDecoderLayer.forward` in HF transformers
+                // (modular_gemma4.py): three residual blocks (attn, mlp,
+                // PLE) followed by a per-layer scalar gain.
+                //
+                // 1. Attention residual
                 let residual = xs;
                 let h = self.input_layernorm.forward(xs)?;
                 let h = self.self_attn.forward(
@@ -892,11 +915,50 @@ impl DecoderLayer {
                 )?;
                 let h = h.apply(&self.post_attention_layernorm)?;
                 let h = (h + residual)?;
-                let residual = &h;
+
+                // 2. MLP residual
+                let residual = h.clone();
                 let h = h.apply(&self.pre_feedforward_layernorm)?;
                 let h = h.apply(&self.mlp)?;
                 let h = h.apply(&self.post_feedforward_layernorm)?;
-                return residual + h;
+                let h = (h + &residual)?;
+
+                // 3. Per-layer-input residual (Gemma 4 PLE side-channel).
+                // HF: `gate(h) → act → * per_layer_input → projection →
+                //      norm → + residual`. Without this block the PLE
+                // signal computed before the layer loop is silently
+                // dropped, and the layer's residual stream loses the
+                // magnitude control built into the trained checkpoint.
+                let h = if let (Some(gate), Some(proj), Some(norm), Some(per_layer_input)) = (
+                    self.per_layer_input_gate.as_ref(),
+                    self.per_layer_projection.as_ref(),
+                    self.post_per_layer_input_norm.as_ref(),
+                    per_layer_input,
+                ) {
+                    let residual = h.clone();
+                    let g = h.apply(gate)?;
+                    let g = g.apply(&self.per_layer_act)?;
+                    let g = g.broadcast_mul(per_layer_input)?;
+                    let g = g.apply(proj)?;
+                    let g = norm.forward(&g)?;
+                    (g + residual)?
+                } else {
+                    h
+                };
+
+                // 4. Per-layer scalar gain. Initialized to 1.0 in HF, but
+                // the trained checkpoint carries a learned value per
+                // layer that controls the outgoing magnitude. Skipping
+                // this multiply was the cause of the runaway
+                // `abs_max=1232` observed on layer-0 in the chat-pwa
+                // diagnostic harness.
+                let h = if let Some(scalar) = &self.layer_scalar {
+                    h.broadcast_mul(scalar)?
+                } else {
+                    h
+                };
+
+                return Ok(h);
             }
         };
 
