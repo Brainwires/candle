@@ -1427,6 +1427,34 @@ impl TextModel {
         self.forward_embeds_hidden_with_per_layer(xs, None, seqlen_offset, batch_size, seq_len)
     }
 
+    /// Same as [`Self::forward_embeds_hidden_with_per_layer`] with a
+    /// per-layer post-state hook. The hook is called after each decoder
+    /// layer with `(layer_idx, current_state)`. AltUp consolidate is
+    /// reported via `layer_idx == self.num_hidden_layers`.
+    ///
+    /// Diagnostic-only — production calls should go through the no-hook
+    /// variants. The hook signature is sync; if it needs to do GPU
+    /// readback (which on wasm32 requires polling), it should clone the
+    /// tensor and defer the readback until after the function returns.
+    pub fn forward_embeds_hidden_with_per_layer_hooked(
+        &mut self,
+        xs: &Tensor,
+        per_layer_inputs: Option<&Tensor>,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+        mut hook: impl FnMut(usize, &Tensor),
+    ) -> Result<Tensor> {
+        self.forward_embeds_hidden_inner(
+            xs,
+            per_layer_inputs,
+            seqlen_offset,
+            batch_size,
+            seq_len,
+            Some(&mut hook),
+        )
+    }
+
     /// Same as [`Self::forward_embeds_hidden`] with an explicit
     /// per-layer-input table for Gemma 3n.
     pub fn forward_embeds_hidden_with_per_layer(
@@ -1436,6 +1464,25 @@ impl TextModel {
         seqlen_offset: usize,
         batch_size: usize,
         seq_len: usize,
+    ) -> Result<Tensor> {
+        self.forward_embeds_hidden_inner(
+            xs,
+            per_layer_inputs,
+            seqlen_offset,
+            batch_size,
+            seq_len,
+            None,
+        )
+    }
+
+    fn forward_embeds_hidden_inner(
+        &mut self,
+        xs: &Tensor,
+        per_layer_inputs: Option<&Tensor>,
+        seqlen_offset: usize,
+        batch_size: usize,
+        seq_len: usize,
+        mut hook: Option<&mut dyn FnMut(usize, &Tensor)>,
     ) -> Result<Tensor> {
         let (attention_mask, sliding_attention_mask) =
             self.create_attention_masks(batch_size, seq_len, seqlen_offset)?;
@@ -1482,7 +1529,10 @@ impl TextModel {
                 seqlen_offset,
                 per_layer_slice.as_ref(),
                 &mut shared_kv_store,
-            )?
+            )?;
+            if let Some(h) = hook.as_mut() {
+                h(layer_idx, &current);
+            }
         }
 
         // ── AltUp consolidate ──────────────────────────────────────
@@ -1509,6 +1559,10 @@ impl TextModel {
         } else {
             current
         };
+
+        if let Some(h) = hook.as_mut() {
+            h(self.num_hidden_layers, &final_hidden);
+        }
 
         final_hidden.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
     }
