@@ -9,7 +9,7 @@ use candle_nn::{linear_b as linear_bias, Activation, Linear, VarBuilder};
 
 use super::config::Gemma4TextConfig;
 
-// ── RmsNorm (Gemma-style with +1 offset) ────────────────────────────────────
+// ── RmsNorm (Gemma 3n / Gemma 4 — plain `weight` gain, no +1 offset) ───────
 
 #[derive(Debug, Clone)]
 struct RmsNorm {
@@ -35,9 +35,14 @@ impl Module for RmsNorm {
         let x = x.to_dtype(internal_dtype)?;
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
-        x_normed
-            .to_dtype(x_dtype)?
-            .broadcast_mul(&(&self.weight + 1.0)?)
+        // Gemma 3n / Gemma 4 use plain `weight` as the gain (HF
+        // `Gemma3nRMSNorm`: `weight = nn.Parameter(torch.ones(dim))`,
+        // forward applies `normed * weight`). This is **different** from
+        // Gemma 1/2's `(1 + weight)` convention where weights are trained
+        // around 0. Applying `(1 + weight)` to Gemma 3n weights doubles
+        // every norm output → Q and K both ~2× → attention scores ~4× →
+        // BF16 softmax overflow at the first global layer → all-NaN logits.
+        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
     }
 }
 
@@ -524,7 +529,16 @@ impl Attention {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
+            // Promote softmax to F32 even when the value dtype is BF16:
+            // exp(score) overflows BF16 (max ≈ 65504) at score ≈ 11, which
+            // is well within normal pre-softmax range for long-context or
+            // sliding-window edge cases. F32 covers Gemma's full range.
+            // Cast back to v's dtype before the V matmul so o_proj sees
+            // the model's native dtype.
+            let v_dtype = v.dtype();
+            let attn_weights = attn_weights.to_dtype(DType::F32)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            let attn_weights = attn_weights.to_dtype(v_dtype)?;
             attn_weights.matmul(&v)?
         };
         attn_output
