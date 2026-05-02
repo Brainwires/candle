@@ -265,16 +265,26 @@ enum KvCache {
     Rotating(candle_nn::kv_cache::RotatingKvCache),
 }
 
+/// Per-step shared K/V store keyed by donor layer index. Populated by
+/// donor `Attention::forward` calls (post-cache-append, pre-`repeat_kv`)
+/// and consumed by receiver layers later in the same forward pass.
+/// Cleared at the start of every `TextModel::forward_embeds_*`. Tensors
+/// are reference-counted (Arc-backed) so the clones are O(1).
+pub(crate) type SharedKvStore = Vec<Option<(Tensor, Tensor)>>;
+
 // ── Attention ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 struct Attention {
     q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
+    /// `None` for receiver layers (KV-shared) — they read K from the donor.
+    k_proj: Option<Linear>,
+    /// `None` for receiver layers — they read V from the donor.
+    v_proj: Option<Linear>,
     o_proj: Linear,
     q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    /// `None` for receiver layers — RoPE was already applied at the donor.
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -289,6 +299,15 @@ struct Attention {
     rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
     rotary_emb_local: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
+    /// `Some(donor_idx)` makes this a receiver layer that reads K/V from
+    /// `shared_kv_store[donor_idx]` instead of running its own
+    /// projections + RoPE + cache append. `None` makes this a donor —
+    /// it computes K/V normally and writes to `shared_kv_store[layer_idx]`
+    /// after the cache append.
+    donor_layer_idx: Option<usize>,
+    /// This layer's index — used by donors to write into the shared
+    /// store. Receivers read via `donor_layer_idx`.
+    layer_idx: usize,
     use_flash_attn: bool,
 }
 
@@ -316,13 +335,35 @@ impl Attention {
         };
 
         let num_kv_groups = num_heads / num_kv_heads;
+        let donor_layer_idx = cfg.donor_layer_idx_for(layer_idx);
+        let is_receiver = donor_layer_idx.is_some();
+
         let q_proj = linear_bias(hidden_sz, num_heads * head_dim, bias, vb.pp("q_proj"))?;
-        let k_proj = linear_bias(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("k_proj"))?;
-        let v_proj = linear_bias(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?;
+        // Receivers don't have their own K/V projections in the canonical
+        // Gemma 3n checkpoint — the donor's K/V is reused. If a checkpoint
+        // does carry the tensors for receiver layers (some exports do),
+        // they're harmless dead weight that we simply never call.
+        let k_proj = if is_receiver {
+            None
+        } else {
+            Some(linear_bias(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("k_proj"))?)
+        };
+        let v_proj = if is_receiver {
+            None
+        } else {
+            Some(linear_bias(hidden_sz, num_kv_heads * head_dim, bias, vb.pp("v_proj"))?)
+        };
         let o_proj = linear_bias(num_heads * head_dim, hidden_sz, bias, vb.pp("o_proj"))?;
         let q_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
-        let k_norm = RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+        let k_norm = if is_receiver {
+            None
+        } else {
+            Some(RmsNorm::new(head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?)
+        };
 
+        // Receivers don't own a KvCache — they read from the donor's
+        // post-append store on every step. We still construct a stub
+        // KvCache so the `clear_kv_cache` path stays uniform.
         let kv_cache = if is_sliding {
             KvCache::Rotating(candle_nn::kv_cache::RotatingKvCache::new(
                 2,
@@ -352,6 +393,8 @@ impl Attention {
             rotary_emb_global,
             rotary_emb_local,
             kv_cache,
+            donor_layer_idx,
+            layer_idx,
             use_flash_attn: cfg.use_flash_attn,
         })
     }
@@ -362,45 +405,101 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
+        // Q is always projected from the layer's own input — receivers
+        // share K/V with their donor but keep their own Q.
         let mut q = self.q_proj.forward(xs)?;
-        let mut k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
         q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
-        // Q/K norms
         q = self.q_norm.forward(&q)?;
-        k = self.k_norm.forward(&k)?;
-        // V norm (RMS without learned weight)
-        let v = v_norm(&v, self.rms_norm_eps)?;
 
-        // Apply RoPE
-        let (q, k) = if self.is_sliding {
-            self.rotary_emb_local
-                .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+        // ── Donor / receiver branch ─────────────────────────────────────
+        // Receivers read post-cache (k_full, v_full) from the donor's
+        // entry in the shared store. Donors compute K/V the usual way
+        // and write the post-append (pre-`repeat_kv`) tensors back so a
+        // later receiver can pick them up.
+        let (k_full, v_full) = if let Some(donor_idx) = self.donor_layer_idx {
+            let donor = shared_kv_store
+                .get(donor_idx)
+                .and_then(|x| x.as_ref())
+                .ok_or_else(|| candle::Error::Msg(format!(
+                    "KV-shared layer {} has no donor entry at index {} \
+                     (donor must execute earlier in the same forward pass)",
+                    self.layer_idx, donor_idx,
+                )))?;
+            (donor.0.clone(), donor.1.clone())
         } else {
-            self.rotary_emb_global
-                .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            let k_proj = self.k_proj.as_ref().ok_or_else(|| candle::Error::Msg(
+                "donor layer is missing its k_proj — checkpoint mismatch?".into(),
+            ))?;
+            let v_proj = self.v_proj.as_ref().ok_or_else(|| candle::Error::Msg(
+                "donor layer is missing its v_proj — checkpoint mismatch?".into(),
+            ))?;
+            let k_norm = self.k_norm.as_ref().ok_or_else(|| candle::Error::Msg(
+                "donor layer is missing its k_norm — checkpoint mismatch?".into(),
+            ))?;
+
+            let mut k = k_proj.forward(xs)?;
+            let v = v_proj.forward(xs)?;
+            k = k
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            k = k_norm.forward(&k)?;
+            let v = v_norm(&v, self.rms_norm_eps)?;
+
+            // Apply RoPE on (q, k); receivers had their q rotated above
+            // separately below.
+            let (q_rot, k_rot) = if self.is_sliding {
+                self.rotary_emb_local
+                    .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            } else {
+                self.rotary_emb_global
+                    .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            };
+            q = q_rot;
+
+            let (k_full, v_full) = match &mut self.kv_cache {
+                KvCache::Normal(cache) => cache.append(&k_rot, &v)?,
+                KvCache::Rotating(cache) => cache.append(&k_rot, &v)?,
+            };
+            // Persist for any downstream receiver mapped onto this layer.
+            // Tensors are Arc-backed so this clone is cheap.
+            if self.layer_idx < shared_kv_store.len() {
+                shared_kv_store[self.layer_idx] =
+                    Some((k_full.clone(), v_full.clone()));
+            }
+            (k_full, v_full)
         };
 
-        let (k, v) = match &mut self.kv_cache {
-            KvCache::Normal(cache) => cache.append(&k, &v)?,
-            KvCache::Rotating(cache) => cache.append(&k, &v)?,
+        // For receivers, q still needs RoPE — apply on q only.
+        let q = if self.donor_layer_idx.is_some() {
+            // We need q_only RoPE; use a cheap helper via the same
+            // rotary embedding by calling apply_rotary_emb_qkv with
+            // a dummy K of the same shape, then discard the K result.
+            // To avoid churning, just rotate q via the embedding's
+            // single-tensor path: fabricate a zero K of matching shape.
+            let dummy_k = q.zeros_like()?;
+            let (q_rot, _) = if self.is_sliding {
+                self.rotary_emb_local
+                    .apply_rotary_emb_qkv(&q, &dummy_k, seqlen_offset)?
+            } else {
+                self.rotary_emb_global
+                    .apply_rotary_emb_qkv(&q, &dummy_k, seqlen_offset)?
+            };
+            q_rot
+        } else {
+            q
         };
 
-        let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
+        let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
 
         let mask = if self.is_sliding {
             sliding_attention_mask
@@ -762,6 +861,7 @@ impl DecoderLayer {
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         per_layer_input: Option<&Tensor>,
+        shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
         let altup = match &self.altup {
             Some(a) => a,
@@ -769,9 +869,13 @@ impl DecoderLayer {
                 // Classic path — no AltUp wiring.
                 let residual = xs;
                 let h = self.input_layernorm.forward(xs)?;
-                let h = self
-                    .self_attn
-                    .forward(&h, attention_mask, sliding_attention_mask, seqlen_offset)?;
+                let h = self.self_attn.forward(
+                    &h,
+                    attention_mask,
+                    sliding_attention_mask,
+                    seqlen_offset,
+                    shared_kv_store,
+                )?;
                 let h = h.apply(&self.post_attention_layernorm)?;
                 let h = (h + residual)?;
                 let residual = &h;
@@ -794,9 +898,13 @@ impl DecoderLayer {
             None
         };
 
-        let attn = self
-            .self_attn
-            .forward(&active_norm, attention_mask, sliding_attention_mask, seqlen_offset)?;
+        let attn = self.self_attn.forward(
+            &active_norm,
+            attention_mask,
+            sliding_attention_mask,
+            seqlen_offset,
+            shared_kv_store,
+        )?;
         let attn = attn.apply(&self.post_attention_layernorm)?;
         let attn_gated = (active + attn)?;
         let attn_laurel = match laurel_out {
@@ -1079,6 +1187,9 @@ pub struct TextModel {
     altup_unembed_projections: Option<Vec<Linear>>,
     altup_num_inputs: usize,
     altup_active_idx: usize,
+    /// Number of decoder layers — used to size the per-step shared KV
+    /// store allocated inside `forward_embeds_hidden_with_per_layer`.
+    num_hidden_layers: usize,
 }
 
 impl TextModel {
@@ -1192,6 +1303,7 @@ impl TextModel {
             altup_unembed_projections,
             altup_num_inputs: cfg.altup_num_inputs,
             altup_active_idx: cfg.altup_active_idx,
+            num_hidden_layers: cfg.num_hidden_layers,
         })
     }
 
@@ -1321,6 +1433,11 @@ impl TextModel {
             (xs.clone(), false)
         };
 
+        // Per-step KV-share scratch: donor layers populate, receivers read.
+        // Cleared (allocated fresh) per call so the (k_full, v_full) entries
+        // always reflect the current step's history.
+        let mut shared_kv_store: SharedKvStore = vec![None; self.num_hidden_layers];
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let per_layer_slice = match per_layer_inputs {
                 Some(table) => Some(table.narrow(2, layer_idx, 1)?.squeeze(2)?),
@@ -1332,6 +1449,7 @@ impl TextModel {
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
                 per_layer_slice.as_ref(),
+                &mut shared_kv_store,
             )?
         }
 

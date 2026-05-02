@@ -200,6 +200,18 @@ pub struct Gemma4TextConfig {
     /// omitted — `corrected[1:] += first` becomes `corrected[1:] += 0`.
     #[serde(default)]
     pub disable_per_layer_input_gate: bool,
+
+    // ── KV-cache sharing (Gemma 3n) ─────────────────────────────────────
+    /// Number of trailing decoder layers that re-use K/V from earlier
+    /// donor layers instead of computing their own. The canonical Gemma
+    /// 3n config sets this to 10 for a 30-layer stack: layers 0..19 are
+    /// donors, layers 20..29 each map to the most-recent donor of the
+    /// same `layer_types[i]` (sliding vs full).
+    ///
+    /// `0` disables KV-share entirely — every layer owns its own K/V
+    /// projections + cache. Mirrors HF `Gemma3nTextConfig.num_kv_shared_layers`.
+    #[serde(default)]
+    pub num_kv_shared_layers: usize,
 }
 
 impl Gemma4TextConfig {
@@ -251,6 +263,31 @@ impl Gemma4TextConfig {
             .as_ref()
             .and_then(|v| v.get(layer_idx).copied())
             .unwrap_or(0.0)
+    }
+
+    /// First layer index in the trailing KV-shared region. Layers in
+    /// `[first_kv_shared_layer_idx, num_hidden_layers)` are receivers.
+    pub fn first_kv_shared_layer_idx(&self) -> usize {
+        self.num_hidden_layers
+            .saturating_sub(self.num_kv_shared_layers)
+    }
+
+    /// For a receiver layer, find the donor — the most recent layer
+    /// before `first_kv_shared_layer_idx` with the same `is_sliding`
+    /// designation. Returns `None` for donor layers (or when KV-share
+    /// is disabled).
+    pub fn donor_layer_idx_for(&self, layer_idx: usize) -> Option<usize> {
+        if self.num_kv_shared_layers == 0 {
+            return None;
+        }
+        let first_shared = self.first_kv_shared_layer_idx();
+        if layer_idx < first_shared {
+            return None;
+        }
+        let want_sliding = self.is_sliding(layer_idx);
+        (0..first_shared)
+            .rev()
+            .find(|&j| self.is_sliding(j) == want_sliding)
     }
 }
 
