@@ -364,6 +364,19 @@ pub struct Gemma4VisionConfig {
     #[serde(default = "default_vision_standardize")]
     pub standardize: bool,
     pub rope_parameters: Option<Gemma4RopeParameters>,
+    /// Vision encoder architecture string. The canonical Gemma 3n
+    /// checkpoint sets this to `"mobilenetv5_300m_enc"`; the existing
+    /// custom-ViT path matches the unset / non-MobileNetV5 case (Gemma 3
+    /// SigLIP-style towers and the Gemma 4 ViT-shaped variant in this
+    /// crate).
+    ///
+    /// `Gemma4Model::attach_vision` reads this to decide which encoder
+    /// to instantiate. Unrecognised strings fall back to the ViT path
+    /// (the trained shape will then mismatch and surface a load-time
+    /// error, which is the correct fail-loud signal for an unsupported
+    /// architecture).
+    #[serde(default)]
+    pub architecture: Option<String>,
 }
 
 impl Gemma4VisionConfig {
@@ -431,7 +444,10 @@ fn default_audio_vocab_size() -> usize {
     128
 }
 fn default_sscp_conv_group_norm_eps() -> f64 {
-    1e-6
+    // Canonical Gemma 3n audio config: sscp_conv_group_norm_eps = 1e-3.
+    // Was 1e-6 prior to F8; the subsampling conv stack relies on the
+    // looser eps for numerical stability on quantised inputs.
+    1e-3
 }
 fn default_sscp_conv_eps() -> f64 {
     1e-3

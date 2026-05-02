@@ -111,7 +111,10 @@ impl SSCPConvBlock {
             },
             vb.pp("conv"),
         )?;
-        let norm = LayerNorm::new(out_channels, cfg.rms_norm_eps);
+        // SSCP norm uses the dedicated `sscp_conv_group_norm_eps` (per HF
+        // `Gemma3nAudioSSCPConvBlock`, which constructs `nn.GroupNorm`
+        // with this eps). Was reading `rms_norm_eps` prior to F8 audit.
+        let norm = LayerNorm::new(out_channels, cfg.sscp_conv_group_norm_eps);
 
         Ok(Self {
             conv,

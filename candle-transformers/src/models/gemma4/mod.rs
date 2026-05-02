@@ -108,7 +108,23 @@ impl Model {
     /// Load the vision tower + vision embedder into an existing model.
     /// `vb` should be the same VarBuilder root used at construction (the one
     /// that gets `.pp("model")` applied internally).
+    ///
+    /// Routes by `cfg.vision_config.architecture`:
+    /// - `Some("mobilenetv5_300m_enc")` — the canonical Gemma 3n vision
+    ///   tower. Returns a clear runtime error until the encoder lands;
+    ///   text-only chat is unaffected because vision attaches lazily.
+    /// - Otherwise — the custom-ViT path used by Gemma 3 / non-3n
+    ///   Gemma 4 deployments.
     pub fn attach_vision(&mut self, vb: candle_nn::VarBuilder) -> Result<()> {
+        if let Some(arch) = self.cfg.vision_config.architecture.as_deref() {
+            if arch == "mobilenetv5_300m_enc" || arch.starts_with("mobilenetv5") {
+                return Err(candle::Error::Msg(format!(
+                    "attach_vision: vision architecture `{arch}` is not yet \
+                     implemented in this candle-fork. Text-only chat is \
+                     unaffected. Tracking issue: F7 (`vision_mobilenet.rs`)."
+                )));
+            }
+        }
         let vb = vb.pp("model");
         let vt = VisionTower::new(&self.cfg.vision_config, vb.pp("vision_tower"))?;
         let ev = MultimodalEmbedder::new(
