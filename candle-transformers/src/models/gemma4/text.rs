@@ -1643,6 +1643,17 @@ impl TextModel {
         final_hidden.narrow(1, seq_len - 1, 1)?.apply(&self.norm)
     }
 
+    /// Per-layer `layer_scalar` tensors in load order, for diagnostic
+    /// readback. `None` for layers where the checkpoint did not carry
+    /// the tensor (older Gemma generations). Length always equals
+    /// `num_hidden_layers`.
+    pub fn layer_scalars(&self) -> Vec<Option<Tensor>> {
+        self.layers
+            .iter()
+            .map(|l| l.layer_scalar.clone())
+            .collect()
+    }
+
     /// Compute the Gemma 3n per-layer-input table once for a given
     /// `(input_ids, inputs_embeds)` pair. Returns `None` when the model
     /// wasn't constructed with PLE.
