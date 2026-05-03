@@ -131,10 +131,21 @@ fn op_for(name: &str, dtype: ScalarDType) -> Option<(&'static str, String)> {
         // Tanh-approximated GELU, matching candle CPU's `gelu()`:
         //   0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
         // sqrt(2/pi) ≈ 0.7978845608028654
+        //
+        // The `tanh` argument is clamped to ±20.0 because some WGSL
+        // backends implement `tanh` as `(exp(2t) - 1) / (exp(2t) + 1)`,
+        // and `exp(2t)` overflows F32 (max safe exp arg ≈ 88.7) when
+        // `|t| > 44`. For Gemma 4 with gate-projection outputs reaching
+        // ±10 in deep layers, the polynomial term `0.044715*x^3`
+        // dominates and pushes `kappa * (x + cube)` past 44, producing
+        // `+inf / +inf = NaN` from the builtin. `tanh(t)` is already
+        // within 1 ulp of ±1 for `|t| > 9` (single precision), so
+        // clamping at 20 is exact in F32 and removes the NaN path.
         "gelu" => {
             "let kappa: f32 = 0.7978845608028654; \
              let cube: f32 = 0.044715 * x * x * x; \
-             return 0.5 * x * (1.0 + tanh(kappa * (x + cube)));"
+             let inner: f32 = clamp(kappa * (x + cube), -20.0, 20.0); \
+             return 0.5 * x * (1.0 + tanh(inner));"
         }
         // erf-based GELU: 0.5 * x * (1 + erf(x / sqrt(2)))
         // WGSL has no erf intrinsic; use the Abramowitz & Stegun 7.1.26
