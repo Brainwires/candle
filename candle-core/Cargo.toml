@@ -32,6 +32,13 @@ rayon = { workspace = true }
 safetensors = { workspace = true }
 thiserror = { workspace = true }
 wgpu = { version = "29", optional = true, default-features = false, features = ["wgsl"] }
+# Native wgpu backends. On wasm32, wgpu uses the browser's WebGPU API
+# directly (no native backend dep); on native, it needs an explicit
+# backend feature or instance creation panics with "No wgpu backend
+# feature that is implemented for the target platform was enabled."
+# `vulkan` covers Linux/Windows/Android, `metal` covers macOS/iOS,
+# `dx12` covers Windows. We list all three; cargo will only compile
+# the ones relevant to the active target.
 yoke = { workspace = true }
 zip = { workspace = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -42,6 +49,13 @@ tokenizers = { workspace = true, features = ["onig"] }
 # would deadlock the browser. The dep is gated by the `wgpu` feature via
 # `optional = true` so it does not pull in on default builds.
 pollster = { version = "0.4", optional = true }
+# Add native backends to wgpu when not building for wasm32. Required so
+# `wgpu::Instance::new` can find an adapter — without this, native `cargo
+# run` panics at instance creation. `vulkan` covers Linux/Windows/Android.
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "linux", target_os = "windows", target_os = "android")))'.dependencies]
+wgpu = { version = "29", optional = true, default-features = false, features = ["wgsl", "vulkan"] }
+[target.'cfg(all(not(target_arch = "wasm32"), any(target_os = "macos", target_os = "ios")))'.dependencies]
+wgpu = { version = "29", optional = true, default-features = false, features = ["wgsl", "metal"] }
 
 [target.'cfg(all(not(target_arch = "wasm32"), not(target_os = "ios")))'.dependencies]
 candle-ug = { workspace = true, optional = true }
