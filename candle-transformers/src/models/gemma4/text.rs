@@ -535,10 +535,18 @@ impl Attention {
             // sliding-window edge cases. F32 covers Gemma's full range.
             // Cast back to v's dtype before the V matmul so o_proj sees
             // the model's native dtype.
+            //
+            // `.contiguous()` calls before each `to_dtype` are needed
+            // because the WGPU `to_dtype` kernel rejects strided sources
+            // (`wgpu_backend/ops/cast.rs:65`). `broadcast_add(mask)` and
+            // `softmax_last_dim` may produce non-contiguous views; the
+            // single-token forward path skipped this entirely (no mask
+            // when seq_len <= 1) so the issue only surfaces with
+            // multi-token prompts.
             let v_dtype = v.dtype();
-            let attn_weights = attn_weights.to_dtype(DType::F32)?;
+            let attn_weights = attn_weights.contiguous()?.to_dtype(DType::F32)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            let attn_weights = attn_weights.to_dtype(v_dtype)?;
+            let attn_weights = attn_weights.contiguous()?.to_dtype(v_dtype)?;
             attn_weights.matmul(&v)?
         };
         attn_output
