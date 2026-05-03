@@ -32,7 +32,13 @@ impl Module for RmsNorm {
             d => d,
         };
         let hidden_size = x.dim(D::Minus1)?;
-        let x = x.to_dtype(internal_dtype)?;
+        // `.contiguous()` before `.to_dtype` because the WGPU `to_dtype`
+        // kernel rejects strided sources (`wgpu_backend/ops/cast.rs:65`).
+        // Callers like `q_norm(q.transpose(1,2))` produce non-contiguous
+        // input. On CPU/CUDA `.contiguous()` is essentially a no-op when
+        // the layout is already contiguous, so this is safe across
+        // backends.
+        let x = x.contiguous()?.to_dtype(internal_dtype)?;
         let norm_x = (x.sqr()?.sum_keepdim(D::Minus1)? / hidden_size as f64)?;
         let x_normed = x.broadcast_div(&(norm_x + self.eps)?.sqrt()?)?;
         // Gemma 3n / Gemma 4 use plain `weight` as the gain (HF
@@ -42,17 +48,25 @@ impl Module for RmsNorm {
         // around 0. Applying `(1 + weight)` to Gemma 3n weights doubles
         // every norm output → Q and K both ~2× → attention scores ~4× →
         // BF16 softmax overflow at the first global layer → all-NaN logits.
-        x_normed.to_dtype(x_dtype)?.broadcast_mul(&self.weight)
+        x_normed
+            .contiguous()?
+            .to_dtype(x_dtype)?
+            .broadcast_mul(&self.weight)
     }
 }
 
 /// Pure RMS normalization without learned weight (used for V norm).
 fn v_norm(v: &Tensor, eps: f64) -> Result<Tensor> {
     let original_dtype = v.dtype();
-    let v_f32 = v.to_dtype(DType::F32)?;
+    // `.contiguous()` before each `to_dtype` for WGPU compatibility
+    // (see RmsNorm::forward comment).
+    let v_f32 = v.contiguous()?.to_dtype(DType::F32)?;
     let mean_sq = v_f32.sqr()?.mean_keepdim(D::Minus1)?;
     let rms = (mean_sq + eps)?.sqrt()?;
-    v_f32.broadcast_div(&rms)?.to_dtype(original_dtype)
+    v_f32
+        .broadcast_div(&rms)?
+        .contiguous()?
+        .to_dtype(original_dtype)
 }
 
 // ── RotaryEmbedding (standard, for sliding layers) ──────────────────────────
