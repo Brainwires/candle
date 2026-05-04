@@ -308,10 +308,10 @@ struct Attention {
     num_kv_heads: usize,
     num_kv_groups: usize,
     head_dim: usize,
-    /// Attention pre-softmax scaling uses `1/√query_pre_attn_scalar`. For
-    /// Gemma 3n E2B this equals `head_dim` (both 256), but configurations
-    /// where global layers carry a larger `head_dim` keep the trained
-    /// scale by reading from the dedicated config field.
+    /// Retained for config compatibility; Gemma 4 sets attention scaling
+    /// to 1.0 (no pre-softmax divide) — q_norm/k_norm produce unit-magnitude
+    /// queries/keys so dot-products are already O(1). See attention forward.
+    #[allow(dead_code)]
     query_pre_attn_scalar: usize,
     rms_norm_eps: f64,
     is_sliding: bool,
@@ -530,14 +530,18 @@ impl Attention {
             let q = q.transpose(1, 2)?;
             let k = k.transpose(1, 2)?;
             let v = v.transpose(1, 2)?;
-            // Gemma 3 / 3n scale by `query_pre_attn_scalar`, not `head_dim` —
-            // they're equal for E2B (both 256) but diverge in variants where
-            // global layers carry a larger head_dim.
-            let scale = 1f32 / (self.query_pre_attn_scalar as f32).sqrt();
-            flash_attn(&q, &k, &v, scale, mask.is_some())?.transpose(1, 2)?
+            // Gemma 4 sets `Gemma4TextAttention.scaling = 1.0` and forwards it
+            // to `eager_attention_forward`, where the `if scaling is None`
+            // default of `head_dim**-0.5` is bypassed. Net effect: NO
+            // pre-softmax scaling. Q and K are pre-normed by q_norm/k_norm
+            // (each producing unit-magnitude per head), so dot-products are
+            // already O(1). Dividing by √query_pre_attn_scalar (=16 for E2B)
+            // would over-flatten softmax and produce confidently-wrong
+            // top-1 tokens. Verified against HF
+            // `transformers/models/gemma4/modeling_gemma4.py`.
+            flash_attn(&q, &k, &v, 1.0, mask.is_some())?.transpose(1, 2)?
         } else {
-            let scale = 1f64 / f64::sqrt(self.query_pre_attn_scalar as f64);
-            let attn_weights = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+            let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
 
             let attn_weights = match mask {
                 None => attn_weights,
