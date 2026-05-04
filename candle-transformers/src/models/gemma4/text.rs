@@ -1260,9 +1260,20 @@ impl PerLayerEmbedding {
 
         let merged = match &self.embed_tokens_per_layer {
             Some(embed) => {
+                // HF wraps `embed_tokens_per_layer` in
+                // `Gemma4TextScaledWordEmbedding(embed_scale = hidden_size_per_layer_input ** 0.5)`,
+                // which silently multiplies the lookup result by
+                // `sqrt(hidden_per_layer)` (= sqrt(256) = 16.0 for E2B).
+                // The trait `PerLayerEmbedTable::lookup` returns the raw
+                // embedding rows (matching `candle_nn::Embedding::forward`),
+                // so we apply the Gemma 4-specific scale here. This is the
+                // canonical port-bug flagged in HF transformers issue
+                // #45206 ("PLE implementation is underdocumented") — same
+                // gap that landed in early llama.cpp / mlx ports.
                 let table = embed.lookup(input_ids)?;
                 let table =
                     table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+                let table = (table * (self.hidden_per_layer as f64).sqrt())?;
                 (proj.broadcast_add(&table)? * self.per_layer_input_scale)?
             }
             None => (proj * self.per_layer_input_scale)?,
