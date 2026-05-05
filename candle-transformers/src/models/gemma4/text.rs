@@ -504,6 +504,19 @@ impl Attention {
                 KvCache::Normal(cache) => cache.append(&k_rot, &v)?,
                 KvCache::Rotating(cache) => cache.append(&k_rot, &v)?,
             };
+            // Materialize a contiguous copy before publishing to the
+            // shared KV store. `cache.append` can return strided views
+            // when the cache backs into a preallocated buffer, and WGPU
+            // (notably AMD/Vulkan) downstream kernels — `repeat_kv`,
+            // `matmul`, `transpose`+`reshape` chains — produce
+            // backend-specific results on strided sources where Metal
+            // happens to handle them correctly. Metal/Mac and Linux/
+            // Vulkan diverged at the first KV-shared receiver layer
+            // because of exactly this layout sensitivity. See upstream
+            // candle PR #3475 / #3325 for the same insight at the
+            // gemma3 KV-cache append boundary.
+            let k_full = k_full.contiguous()?;
+            let v_full = v_full.contiguous()?;
             checkpoint!("self_attn/k_full_from_proj", &k_full);
             checkpoint!("self_attn/v_full_from_proj", &v_full);
             // Persist for any downstream receiver mapped onto this layer.

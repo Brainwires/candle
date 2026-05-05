@@ -253,9 +253,11 @@ fn rope_check_cs(cs: &Tensor, b_sz: usize) -> Result<(usize, usize)> {
 }
 
 pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let cos = cos.to_dtype(xs.dtype())?;
+    let sin = sin.to_dtype(xs.dtype())?;
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
+    let (cos_seq_len, cos_n_embd) = rope_check_cs(&cos, b_sz)?;
+    let (sin_seq_len, sin_n_embd) = rope_check_cs(&sin, b_sz)?;
     if cos_n_embd * 2 != n_embd
         || sin_n_embd * 2 != n_embd
         || seq_len > cos_seq_len
@@ -277,7 +279,7 @@ pub fn rope_i(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbI)
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmbI)
 }
 
 pub fn rope_i_slow(x: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
@@ -538,9 +540,11 @@ impl candle::CustomOp3 for RotaryEmb {
 }
 
 pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let cos = cos.to_dtype(xs.dtype())?;
+    let sin = sin.to_dtype(xs.dtype())?;
     let (b_sz, _n_head, seq_len, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
+    let (cos_seq_len, cos_n_embd) = rope_check_cs(&cos, b_sz)?;
+    let (sin_seq_len, sin_n_embd) = rope_check_cs(&sin, b_sz)?;
     if cos_n_embd * 2 != n_embd
         || sin_n_embd * 2 != n_embd
         || seq_len > cos_seq_len
@@ -562,7 +566,7 @@ pub fn rope(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmb)
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmb)
 }
 
 fn rotate_half(xs: &Tensor) -> Result<Tensor> {
@@ -823,9 +827,11 @@ impl candle::CustomOp3 for RotaryEmbThd {
 }
 
 pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
+    let cos = cos.to_dtype(xs.dtype())?;
+    let sin = sin.to_dtype(xs.dtype())?;
     let (b_sz, seq_len, _n_head, n_embd) = xs.dims4()?;
-    let (cos_seq_len, cos_n_embd) = rope_check_cs(cos, b_sz)?;
-    let (sin_seq_len, sin_n_embd) = rope_check_cs(sin, b_sz)?;
+    let (cos_seq_len, cos_n_embd) = rope_check_cs(&cos, b_sz)?;
+    let (sin_seq_len, sin_n_embd) = rope_check_cs(&sin, b_sz)?;
     if cos_n_embd * 2 != n_embd
         || sin_n_embd * 2 != n_embd
         || seq_len > cos_seq_len
@@ -847,5 +853,5 @@ pub fn rope_thd(xs: &Tensor, cos: &Tensor, sin: &Tensor) -> Result<Tensor> {
     if !sin.is_contiguous() {
         candle::bail!("sin has to be contiguous in rope")
     }
-    xs.apply_op3_no_bwd(cos, sin, &RotaryEmbThd)
+    xs.apply_op3_no_bwd(&cos, &sin, &RotaryEmbThd)
 }
