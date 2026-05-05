@@ -339,7 +339,7 @@ impl WgpuDevice {
             backend.insert(Backends::BROWSER_WEBGPU);
         }
 
-        let instance = wgpu::Instance::new(&InstanceDescriptor {
+        let instance = wgpu::Instance::new(InstanceDescriptor {
             backends: backend,
             flags: InstanceFlags::default(),
             backend_options: wgpu::BackendOptions {
@@ -349,7 +349,7 @@ impl WgpuDevice {
                 },
                 ..Default::default()
             },
-            ..Default::default()
+            ..InstanceDescriptor::new_without_display_handle()
         });
 
         // `request_adapter` instantiates the general connection to the GPU

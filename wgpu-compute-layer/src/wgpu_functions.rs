@@ -1217,6 +1217,8 @@ pub(crate) fn get_shader(device: &wgpu::Device, shader: &str) -> wgpu::ShaderMod
                 bounds_checks: false,
                 force_loop_bounding: false,
                 ray_query_initialization_tracking: true,
+                mesh_shader_primitive_indices_clamp: true,
+                task_shader_dispatch_tracking: true,
             },
         );
         cs_module

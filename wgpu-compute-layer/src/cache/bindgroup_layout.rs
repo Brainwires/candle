@@ -160,7 +160,7 @@ impl BindgroupLayouts {
 
             let pipeline_layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[&bindgroup_layout],
+                bind_group_layouts: &[Some(&bindgroup_layout)],
                 immediate_size: crate::device::MAX_IMMEDIATE_VALUE * 4,
             });
 
