@@ -425,8 +425,18 @@ impl Attention {
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         shared_kv_store: &mut SharedKvStore,
+        intra_hook: &mut Option<&mut dyn FnMut(usize, &str, &Tensor)>,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
+        let layer_idx = self.layer_idx;
+
+        macro_rules! checkpoint {
+            ($step:expr, $tensor:expr) => {
+                if let Some(hook) = intra_hook.as_deref_mut() {
+                    hook(layer_idx, $step, $tensor);
+                }
+            };
+        }
 
         // Q is always projected from the layer's own input — receivers
         // share K/V with their donor but keep their own Q.
@@ -434,7 +444,9 @@ impl Attention {
         q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
+        checkpoint!("self_attn/q_after_proj_reshape", &q);
         q = self.q_norm.forward(&q)?;
+        checkpoint!("self_attn/q_after_qnorm", &q);
 
         // ── Donor / receiver branch ─────────────────────────────────────
         // Receivers read post-cache (k_full, v_full) from the donor's
@@ -450,7 +462,11 @@ impl Attention {
                      (donor must execute earlier in the same forward pass)",
                     self.layer_idx, donor_idx,
                 )))?;
-            (donor.0.clone(), donor.1.clone())
+            let k_full = donor.0.clone();
+            let v_full = donor.1.clone();
+            checkpoint!("self_attn/k_full_from_donor", &k_full);
+            checkpoint!("self_attn/v_full_from_donor", &v_full);
+            (k_full, v_full)
         } else {
             let k_proj = self.k_proj.as_ref().ok_or_else(|| candle::Error::Msg(
                 "donor layer is missing its k_proj — checkpoint mismatch?".into(),
@@ -488,6 +504,8 @@ impl Attention {
                 KvCache::Normal(cache) => cache.append(&k_rot, &v)?,
                 KvCache::Rotating(cache) => cache.append(&k_rot, &v)?,
             };
+            checkpoint!("self_attn/k_full_from_proj", &k_full);
+            checkpoint!("self_attn/v_full_from_proj", &v_full);
             // Persist for any downstream receiver mapped onto this layer.
             // Tensors are Arc-backed so this clone is cheap.
             if self.layer_idx < shared_kv_store.len() {
@@ -516,9 +534,12 @@ impl Attention {
         } else {
             q
         };
+        checkpoint!("self_attn/q_after_rope", &q);
 
         let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
         let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
+        checkpoint!("self_attn/k_after_repeat_kv", &k);
+        checkpoint!("self_attn/v_after_repeat_kv", &v);
 
         let mask = if self.is_sliding {
             sliding_attention_mask
@@ -542,11 +563,13 @@ impl Attention {
             flash_attn(&q, &k, &v, 1.0, mask.is_some())?.transpose(1, 2)?
         } else {
             let attn_weights = q.matmul(&k.transpose(2, 3)?)?;
+            checkpoint!("self_attn/attn_weights_pre_mask", &attn_weights);
 
             let attn_weights = match mask {
                 None => attn_weights,
                 Some(mask) => attn_weights.broadcast_add(mask)?,
             };
+            checkpoint!("self_attn/attn_weights_post_mask", &attn_weights);
             // Promote softmax to F32 even when the value dtype is BF16:
             // exp(score) overflows BF16 (max ≈ 65504) at score ≈ 11, which
             // is well within normal pre-softmax range for long-context or
@@ -565,7 +588,10 @@ impl Attention {
             let attn_weights = attn_weights.contiguous()?.to_dtype(DType::F32)?;
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
             let attn_weights = attn_weights.contiguous()?.to_dtype(v_dtype)?;
-            attn_weights.matmul(&v)?
+            checkpoint!("self_attn/attn_weights_post_softmax", &attn_weights);
+            let attn_v = attn_weights.matmul(&v)?;
+            checkpoint!("self_attn/attn_after_v_matmul", &attn_v);
+            attn_v
         };
         attn_output
             .transpose(1, 2)?
@@ -950,6 +976,7 @@ impl DecoderLayer {
                     sliding_attention_mask,
                     seqlen_offset,
                     shared_kv_store,
+                    intra_hook,
                 )?;
                 checkpoint!("post_self_attn", &h);
                 let h = h.apply(&self.post_attention_layernorm)?;
@@ -1034,6 +1061,7 @@ impl DecoderLayer {
             sliding_attention_mask,
             seqlen_offset,
             shared_kv_store,
+            intra_hook,
         )?;
         let attn = attn.apply(&self.post_attention_layernorm)?;
         let attn_gated = (active + attn)?;
