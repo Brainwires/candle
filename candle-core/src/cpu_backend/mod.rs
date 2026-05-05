@@ -2949,6 +2949,21 @@ impl BackendStorage for CpuStorage {
         lhs_l: &Layout,
         rhs_l: &Layout,
     ) -> Result<Self> {
+        // gemm 0.19 has no `gemm-bf16`, so the generic Map2 path rejects
+        // bf16. Mixed-device flows (e.g. wgpu wasm32 readback landing on
+        // CPU as bf16) trip this every token at lm_head. Promote to f32,
+        // run f32 gemm, demote.
+        if let (CpuStorage::BF16(_), CpuStorage::BF16(_)) = (self, rhs) {
+            let lhs_f32 = self.to_dtype(lhs_l, DType::F32)?;
+            let rhs_f32 = rhs.to_dtype(rhs_l, DType::F32)?;
+            let lhs_l_f32 = Layout::contiguous(lhs_l.shape());
+            let rhs_l_f32 = Layout::contiguous(rhs_l.shape());
+            let out_f32 = MatMul(bmnk).map(&lhs_f32, &lhs_l_f32, &rhs_f32, &rhs_l_f32)?;
+            let (b, m, n, _) = bmnk;
+            let out_shape = Shape::from((b, m, n));
+            let out_l = Layout::contiguous(&out_shape);
+            return out_f32.to_dtype(&out_l, DType::BF16);
+        }
         MatMul(bmnk).map(self, lhs_l, rhs, rhs_l)
     }
 
