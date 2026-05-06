@@ -114,7 +114,11 @@ pub fn main() {
 
         //create the File:
         let mut available_types = Vec::new();
-        const TYPES : [&str;6] = ["f32", "u32", "i64", "f64", "f16", "u8"];
+        // BF16 generates a separate per-type shader. Kernels that don't
+        // opt into BF16 (no `#ifdef bf16` branch in their pwgsl source)
+        // simply produce no `bf16` output file via `create_shader_file`,
+        // which `available_types` already accounts for via its return.
+        const TYPES : [&str;7] = ["f32", "u32", "i64", "f64", "f16", "u8", "bf16"];
         for dtype in TYPES{
             if create_shader_file([(dtype.to_string(), DefineDefinition::new_empty())].into_iter().collect(), &format!("_generated_{dtype}.wgsl")){
                 available_types.push(dtype);
