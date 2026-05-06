@@ -1,4 +1,14 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
+//
+// BF16 coverage for matmul is intentionally partial. The simple naive
+// kernels (matmul1, matmul1_m1) are bf16-aware; the vec4 path
+// (matmul1_16) and the tiled matmul7 are f32+ only because their
+// data-shape assumptions (vec4<DTYPE> as a vec4 of single elements,
+// shared-memory tiles typed as DTYPE) don't translate to the bf16
+// packed layout without significant restructure. Dispatch should
+// avoid Matmul1_4 / Matmul7 for bf16 inputs (see
+// candle-core/src/wgpu_backend/wgpu_functions/matmul.rs).
 
 override CONSTV_0 : bool = true;
 override CONSTV_1 : bool = true;
@@ -45,24 +55,34 @@ fn matmul1(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let output_size_of_one_batch = select(0u, op_matmul_m * op_matmul_n,op_matmul_use_batch); 
+    let output_size_of_one_batch = select(0u, op_matmul_m * op_matmul_n,op_matmul_use_batch);
 
     let input1_offset = op_matmul_input1_offset;
     let input2_offset = op_matmul_input2_offset;
 
-    let input1_stride_b = select(0u, op_matmul_input1_stride_b,op_matmul_use_batch); 
-    let input2_stride_b = select(0u, op_matmul_input2_stride_b,op_matmul_use_batch); 
-    
+    let input1_stride_b = select(0u, op_matmul_input1_stride_b,op_matmul_use_batch);
+    let input2_stride_b = select(0u, op_matmul_input2_stride_b,op_matmul_use_batch);
+
     let m_input1_offset = input1_offset + op_matmul_input1_stride_m * y + b * input1_stride_b;
     let m_input2_offset = input2_offset + op_matmul_input2_stride_n * x + b * input2_stride_b;
 
+#ifdef bf16
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < op_matmul_k; i++){
+        let a = BF16_LOAD(v_input1, op_matmul_input1_stride_k * i + m_input1_offset);
+        let b_ = BF16_LOAD(v_input2, op_matmul_input2_stride_k * i + m_input2_offset);
+        sum += a * b_;
+    }
+    BF16_STORE_ATOMIC(v_dest, b * output_size_of_one_batch + y * op_matmul_n + x, sum);
+#else
     var sum = ZERO;
     for (var i = 0u; i < op_matmul_k; i++){
-        sum +=  v_input1[op_matmul_input1_stride_k * i + m_input1_offset] 
+        sum +=  v_input1[op_matmul_input1_stride_k * i + m_input1_offset]
                 * v_input2[op_matmul_input2_stride_k * i + m_input2_offset];
     }
-    
+
     v_dest[b * output_size_of_one_batch + y * op_matmul_n + x] = sum;
+#endif
 }
 
 
@@ -77,27 +97,42 @@ fn matmul1_m1(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let output_size_of_one_batch = select(0u, op_matmul_m * op_matmul_n,op_matmul_use_batch); 
+    let output_size_of_one_batch = select(0u, op_matmul_m * op_matmul_n,op_matmul_use_batch);
 
     let input1_offset = op_matmul_input1_offset;
     let input2_offset = op_matmul_input2_offset;
 
-    let input1_stride_b = select(0u, op_matmul_input1_stride_b,op_matmul_use_batch); 
-    let input2_stride_b = select(0u, op_matmul_input2_stride_b,op_matmul_use_batch); 
-    
+    let input1_stride_b = select(0u, op_matmul_input1_stride_b,op_matmul_use_batch);
+    let input2_stride_b = select(0u, op_matmul_input2_stride_b,op_matmul_use_batch);
+
     let m_input1_offset = input1_offset + op_matmul_input1_stride_m * y + b * input1_stride_b;
     let m_input2_offset = input2_offset + op_matmul_input2_stride_n * x + b * input2_stride_b;
 
+#ifdef bf16
+    var sum: f32 = 0.0;
+    for (var i = 0u; i < op_matmul_k; i++){
+        let a = BF16_LOAD(v_input1, op_matmul_input1_stride_k * i + m_input1_offset);
+        let b_ = BF16_LOAD(v_input2, op_matmul_input2_stride_k * i + m_input2_offset);
+        sum += a * b_;
+    }
+    BF16_STORE_ATOMIC(v_dest, b * output_size_of_one_batch + y * op_matmul_n + x, sum);
+#else
     var sum = ZERO;
     for (var i = 0u; i < op_matmul_k; i++){
-        sum +=  v_input1[op_matmul_input1_stride_k * i + m_input1_offset] 
+        sum +=  v_input1[op_matmul_input1_stride_k * i + m_input1_offset]
                 * v_input2[op_matmul_input2_stride_k * i + m_input2_offset];
     }
-    
+
     v_dest[b * output_size_of_one_batch + y * op_matmul_n + x] = sum;
+#endif
 }
 
 
+#ifndef bf16
+// vec4 path. For bf16, vec4<u32> is 8 packed BF16 elements; the
+// vector dot semantics don't translate without unpacking, so this
+// kernel and matmul7 (next) are gated out of bf16 codegen. Dispatch
+// must avoid Matmul1_4 / Matmul7 for bf16 (see matmul.rs).
 @group(0) @binding(2)
 var<storage> v_input_a: array<vec4<DTYPE>>;
 
@@ -306,3 +341,4 @@ fn matmul7(@builtin(workgroup_id) group_id: vec3<u32>, @builtin(local_invocation
         }
     }
 }
+#endif

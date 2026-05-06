@@ -1,4 +1,7 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs. The source has
+// an explicit `#ifdef bf16` branch using the BF16_LOAD / BF16_STORE_ATOMIC
+// macros, so bf16 codegen is correct for this kernel.
 
 #ifdef bf16
 // BF16 path: storage is u32-packed (2 bf16 per word), compute in f32.

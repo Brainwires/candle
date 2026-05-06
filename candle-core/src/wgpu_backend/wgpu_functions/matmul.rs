@@ -1450,8 +1450,14 @@ fn get_matmul_naive(
     k: usize,
     input1: WgpuTensor,
     input2: WgpuTensor,
+    allow_vec4: bool,
 ) -> crate::wgpu_backend::MatmulAlgorithm {
-    if k.is_multiple_of(4)
+    // The vec4 path (Matmul1_4 → matmul1_16 in WGSL) only exists for
+    // dtypes whose vec4<DTYPE> represents 4 elements. For BF16 storage,
+    // vec4<u32> packs 8 BF16 elements per vec4 and the dot semantics
+    // diverge — caller must pass `allow_vec4=false` for BF16.
+    if allow_vec4
+        && k.is_multiple_of(4)
         && input1.layout().start_offset().is_multiple_of(4)
         && input2.layout().start_offset().is_multiple_of(4)
     {
@@ -1496,6 +1502,17 @@ pub fn queue_matmul_buffer_best(
     let input2_stride_n = *input2_stride.next().unwrap_or(&1);
     let input2_stride_k = *input2_stride.next().unwrap_or(&1);
 
+    // BF16 only has matmul1 / matmul1_m1 in the WGSL kernel set. The
+    // vec4 path (Matmul1_4) and tiled paths (Matmul7 + sgemm
+    // 24_*/32_*/64_* algorithms) assume DTYPE-sized elements, but for
+    // bf16 DTYPE=u32 packs 2 BF16 per word — the math doesn't translate
+    // directly. Force the naive path with vec4 disabled so dispatch
+    // stays within the bf16-supported kernel set.
+    if matches!(dtype, crate::DType::BF16) {
+        let alg = get_matmul_naive(m, k, input1.clone(), input2.clone(), false);
+        return queue_matmul_buffer_alg(dev, buffer_dest, input1, input2, params, dtype, alg);
+    }
+
     let alg;
     if m <= 2 || n <= 2 {
         if m <= 2 {
@@ -1520,10 +1537,10 @@ pub fn queue_matmul_buffer_best(
             } else if k.is_multiple_of(64) && n.is_multiple_of(64) && input2_stride_n == 1 {
                 alg = MatmulAlgorithm::Matmul1_64;
             } else {
-                alg = get_matmul_naive(m, k, input1, input2);
+                alg = get_matmul_naive(m, k, input1, input2, true);
             }
         } else {
-            alg = get_matmul_naive(m, k, input1, input2);
+            alg = get_matmul_naive(m, k, input1, input2, true);
         }
     } else {
         let shaders = [
@@ -1627,7 +1644,7 @@ pub fn queue_matmul_buffer_best(
         } else if let Some(entry) = best_wgs_25 {
             alg = entry.clone();
         } else {
-            alg = get_matmul_naive(m, k, input1, input2);
+            alg = get_matmul_naive(m, k, input1, input2, true);
         }
     }
     queue_matmul_buffer_alg(dev, buffer_dest, input1, input2, params, dtype, alg)

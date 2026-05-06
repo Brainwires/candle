@@ -114,12 +114,30 @@ pub fn main() {
 
         //create the File:
         let mut available_types = Vec::new();
-        // BF16 generates a separate per-type shader. Kernels that don't
-        // opt into BF16 (no `#ifdef bf16` branch in their pwgsl source)
-        // simply produce no `bf16` output file via `create_shader_file`,
-        // which `available_types` already accounts for via its return.
+        // BF16 generates a separate per-type shader. Kernels without an
+        // explicit `#ifdef bf16` branch would otherwise produce broken
+        // bf16 codegen (DTYPE collapses to `u32`, treating BF16 buffers
+        // as raw u32 arrays — silent garbage at runtime). Gate bf16
+        // codegen behind an opt-in sentinel: only kernels whose source
+        // contains the literal token `// BF16_SUPPORTED` get a bf16
+        // generated file. Dispatch then fails with a clear "no
+        // pipeline" error for unsupported (kernel, BF16) combinations
+        // instead of silently miscomputing.
+        let bf16_supported = fs::read_to_string(file)
+            .map(|s| s.contains("// BF16_SUPPORTED"))
+            .unwrap_or(false);
         const TYPES : [&str;7] = ["f32", "u32", "i64", "f64", "f16", "u8", "bf16"];
         for dtype in TYPES{
+            if dtype == "bf16" && !bf16_supported {
+                // Skip bf16 codegen for kernels that haven't opted in.
+                // Also delete any stale bf16 generated file from a
+                // previous build that might have produced one.
+                let stale = generated_dir.join(format!("{}_generated_bf16.wgsl", original_file_name));
+                if fs::exists(&stale).unwrap_or(false) {
+                    fs::remove_file(&stale).expect("Failed to remove stale bf16 shader file");
+                }
+                continue;
+            }
             if create_shader_file([(dtype.to_string(), DefineDefinition::new_empty())].into_iter().collect(), &format!("_generated_{dtype}.wgsl")){
                 available_types.push(dtype);
             }

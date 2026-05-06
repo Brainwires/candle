@@ -1,4 +1,5 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
 
 // Interleaved rotary embeddings (y0 = x0*cos - x1*sin ; y1 = x0*sin + x1*cos)
 //
@@ -7,6 +8,20 @@
 // @group(0) @binding(2) var<storage> v_input1: array<DTYPE>;           // src (s1)
 // @group(0) @binding(3) var<storage> v_input2: array<DTYPE>;           // cos  (s2)
 // @group(0) @binding(4) var<storage> v_input3: array<DTYPE>;           // sin  (s3)
+
+// Load/store helpers. For bf16 the buffers are u32-packed and ROPE_TYPE
+// is f32 (compute is f32 internally). For all other dtypes ROPE_TYPE is
+// DTYPE and the access is direct.
+#ifdef bf16
+#define ROPE_TYPE f32
+#define ROPE_LOAD(buf, idx) BF16_LOAD(buf, idx)
+#define ROPE_STORE(idx, val) BF16_STORE_ATOMIC(v_dest, idx, val)
+#else
+#define ROPE_TYPE DTYPE
+#define ROPE_LOAD(buf, idx) (buf)[idx]
+#define ROPE_STORE(idx, val) v_dest[idx] = val
+#endif
+
 override CONSTV_0 : u32 = 0u;
 
 LOAD_INFO(op_rotary, 7)
@@ -64,20 +79,20 @@ fn rotary_emb_i(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // load values (assume contiguous storage, no layout helpers)
     // NOTE: shader assumes v_input1, v_input2, v_input3 contain enough elements and are contiguous as described.
-    let x0: DTYPE = v_input1[idx0 + src_offset];
-    let x1: DTYPE = v_input1[idx1 + src_offset];
-    let c: DTYPE = v_input2[rope_i + cos_offset];
-    let s: DTYPE = v_input3[rope_i + sin_offset];
+    let x0: ROPE_TYPE = ROPE_LOAD(v_input1, idx0 + src_offset);
+    let x1: ROPE_TYPE = ROPE_LOAD(v_input1, idx1 + src_offset);
+    let c: ROPE_TYPE = ROPE_LOAD(v_input2, rope_i + cos_offset);
+    let s: ROPE_TYPE = ROPE_LOAD(v_input3, rope_i + sin_offset);
 
     // compute rotary interleaved pair
     // y0 = x0 * cos - x1 * sin
     // y1 = x0 * sin + x1 * cos
-    let y0: DTYPE = x0 * c - x1 * s;
-    let y1: DTYPE = x0 * s + x1 * c;
+    let y0: ROPE_TYPE = x0 * c - x1 * s;
+    let y1: ROPE_TYPE = x0 * s + x1 * c;
 
     // write back
-    v_dest[idx0] = y0;
-    v_dest[idx1] = y1;
+    ROPE_STORE(idx0, y0);
+    ROPE_STORE(idx1, y1);
 }
 
 
@@ -132,20 +147,20 @@ fn rotary_emb_c(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // load values
-    let x0: DTYPE = v_input1[idx0 + src_offset];
-    let x1: DTYPE = v_input1[idx1 + src_offset];
-    let c: DTYPE = v_input2[rope_i + cos_offset];
-    let s: DTYPE = v_input3[rope_i + sin_offset];
+    let x0: ROPE_TYPE = ROPE_LOAD(v_input1, idx0 + src_offset);
+    let x1: ROPE_TYPE = ROPE_LOAD(v_input1, idx1 + src_offset);
+    let c: ROPE_TYPE = ROPE_LOAD(v_input2, rope_i + cos_offset);
+    let s: ROPE_TYPE = ROPE_LOAD(v_input3, rope_i + sin_offset);
 
     // compute rotary
     // y0 = x0 * cos - x1 * sin
     // y1 = x0 * sin + x1 * cos
-    let y0: DTYPE = x0 * c - x1 * s;
-    let y1: DTYPE = x0 * s + x1 * c;
+    let y0: ROPE_TYPE = x0 * c - x1 * s;
+    let y1: ROPE_TYPE = x0 * s + x1 * c;
 
     // write back contiguously
-    v_dest[idx0] = y0;
-    v_dest[idx1] = y1;
+    ROPE_STORE(idx0, y0);
+    ROPE_STORE(idx1, y1);
 }
 
 @compute
@@ -199,16 +214,16 @@ fn rotary_emb_thd(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // load values
-    let x0: DTYPE = v_input1[idx0 + src_offset];
-    let x1: DTYPE = v_input1[idx1 + src_offset];
-    let c: DTYPE = v_input2[rope_i + cos_offset];
-    let s: DTYPE = v_input3[rope_i + sin_offset];
+    let x0: ROPE_TYPE = ROPE_LOAD(v_input1, idx0 + src_offset);
+    let x1: ROPE_TYPE = ROPE_LOAD(v_input1, idx1 + src_offset);
+    let c: ROPE_TYPE = ROPE_LOAD(v_input2, rope_i + cos_offset);
+    let s: ROPE_TYPE = ROPE_LOAD(v_input3, rope_i + sin_offset);
 
     // compute rotary
-    let y0: DTYPE = x0 * c - x1 * s;
-    let y1: DTYPE = x0 * s + x1 * c;
+    let y0: ROPE_TYPE = x0 * c - x1 * s;
+    let y1: ROPE_TYPE = x0 * s + x1 * c;
 
     // write back
-    v_dest[idx0] = y0;
-    v_dest[idx1] = y1;
+    ROPE_STORE(idx0, y0);
+    ROPE_STORE(idx1, y1);
 }

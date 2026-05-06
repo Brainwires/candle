@@ -1,13 +1,24 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
 
 override CONSTV_0 : u32 = 1u;
 override CONSTV_1 : u32 = 1u;
 
 #define op_softmax_input1_offset               CONSTV_0
 
-var<workgroup> sharedSums: array<DTYPE, 64>; 
+#ifdef bf16
+// BF16 path: f32 internal compute (reductions in BF16 would lose
+// precision). sharedSums is f32; inputs are BF16-loaded; outputs go
+// through BF16_STORE_ATOMIC. Single-pass write avoids the
+// write-then-read-then-rewrite pattern of the f32 kernel — we
+// recompute exp(x - max) in the final write loop instead of caching
+// it in v_dest.
+var<workgroup> sharedSums: array<f32, 64>;
+#else
+var<workgroup> sharedSums: array<DTYPE, 64>;
+#endif
 
-var<workgroup> sharedM: f32; 
+var<workgroup> sharedM: f32;
 
 #ifdef f32
 
@@ -22,12 +33,12 @@ LOAD_INFO(op_softmax, 2)
 fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let tid = global_id.x;
     let output_index = global_id.y + select(0u, global_id.z * 65535,USE_Z);
-    
+
     //Start Index of the Elements to Reduce
     let start_index = output_index * op_softmax_length;
     let start_index1 = start_index + op_softmax_input1_offset;
 
-    //We split the Reduction into 64 threads -> find the sub region we need to reduce over 
+    //We split the Reduction into 64 threads -> find the sub region we need to reduce over
     var maxVal = MINVALUE;
     if(output_index < op_softmax_dest_size || !USE_Z)
     {
@@ -36,7 +47,7 @@ fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
             maxVal = max(maxVal, v_input1[start_index1 + i]);
         }
     }
-    sharedSums[tid] = maxVal; 
+    sharedSums[tid] = maxVal;
     workgroupBarrier();
 
     //calculate max
@@ -65,7 +76,7 @@ fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     sharedSums[tid] = sum;
-   
+
     workgroupBarrier();
 
     // Parallel reduction to sum the exponentials
@@ -87,6 +98,87 @@ fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (output_index < op_softmax_dest_size || !USE_Z) {
         for (var i = tid; i < op_softmax_length; i += 64u) {
             v_dest[start_index + i] /= totalSum;
+        }
+    }
+}
+
+#endif
+
+#ifdef bf16
+
+override USE_Z : bool = false;
+
+LOAD_INFO(op_softmax, 2)
+#define op_softmax_length                       op_softmax[0]
+#define op_softmax_dest_size                    op_softmax[1]
+
+// BF16 path: f32 internal compute. Single-pass write — exp(x - max)
+// is recomputed in the final write loop instead of being cached in
+// v_dest, avoiding an atomic-load-modify-store cycle on the bf16
+// destination.
+@compute
+@workgroup_size(64,1,1)
+fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let tid = global_id.x;
+    let output_index = global_id.y + select(0u, global_id.z * 65535,USE_Z);
+
+    let start_index = output_index * op_softmax_length;
+    let start_index1 = start_index + op_softmax_input1_offset;
+
+    // Pass 1: find max.
+    var maxVal: f32 = -3.40282e+38;
+    if(output_index < op_softmax_dest_size || !USE_Z) {
+        for (var i = tid; i < op_softmax_length; i += 64u) {
+            maxVal = max(maxVal, BF16_LOAD(v_input1, start_index1 + i));
+        }
+    }
+    sharedSums[tid] = maxVal;
+    workgroupBarrier();
+
+    if (tid < 32u) {
+        sharedSums[tid] = max(sharedSums[tid], sharedSums[tid + 32u]);
+    }
+    workgroupBarrier();
+    if (tid == 0) {
+        var global_max = sharedSums[0];
+        for (var i = 1u; i < 32u; i++) {
+            global_max = max(global_max, sharedSums[i]);
+        }
+        sharedSums[0] = global_max;
+    }
+    workgroupBarrier();
+    let maxElement = sharedSums[0];
+
+    // Pass 2: sum of exp(x - max).
+    var sum: f32 = 0.0;
+    if (output_index < op_softmax_dest_size || !USE_Z) {
+        for (var i = tid; i < op_softmax_length; i += 64u) {
+            let v = BF16_LOAD(v_input1, start_index1 + i);
+            sum += exp(v - maxElement);
+        }
+    }
+    sharedSums[tid] = sum;
+    workgroupBarrier();
+
+    if (tid < 32u) {
+        sharedSums[tid] += sharedSums[tid + 32u];
+    }
+    workgroupBarrier();
+    if (tid == 0) {
+        var global_sum = sharedSums[0];
+        for (var i = 1u; i < 32u; i++) {
+            global_sum += sharedSums[i];
+        }
+        sharedSums[0] = global_sum;
+    }
+    workgroupBarrier();
+    let totalSum = sharedSums[0];
+
+    // Pass 3: write exp(x - max) / totalSum directly.
+    if (output_index < op_softmax_dest_size || !USE_Z) {
+        for (var i = tid; i < op_softmax_length; i += 64u) {
+            let v = BF16_LOAD(v_input1, start_index1 + i);
+            BF16_STORE_ATOMIC(v_dest, start_index + i, exp(v - maxElement) / totalSum);
         }
     }
 }

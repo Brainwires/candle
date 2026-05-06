@@ -1,4 +1,5 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
 
 LOAD_INFO_UNKNOWN_SIZE(op_index_input, 5)
 #define op_index_input_stride_x    op_index_input[0]
@@ -8,17 +9,54 @@ LOAD_INFO_UNKNOWN_SIZE(op_index_input, 5)
 #define op_index_length            op_index_input[4]
 #define op_index_input_layout1     5u
 
+#ifdef bf16
+// BF16 path: v_input2 is u32-packed (read via BF16_LOAD); v_dest is
+// `array<atomic<u32>>` and writes go through BF16_STORE_ATOMIC. Adjacent
+// output_id values share a u32 word, so the CAS loop in BF16_STORE_ATOMIC
+// is required to avoid losing concurrent halfword writes.
 @compute
 @workgroup_size(8,8,1)
 fn index_select_u32(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    
+
     let workgroup_id = global_id.x;
     let output_index = global_id.y;
 
     GET_INDEX2(op_index_input,op_index_input_layout1, output_index, pos2_is_valid, pos2_id)
     if(pos2_is_valid){
         let dim_index = v_input1_u32[pos2_id];
-        
+
+        let input_stride_x = op_index_input_stride_x;
+        let input_stride_y = op_index_input_stride_y;
+        let output_stride_x = op_index_output_stride_x;
+        let output_stride_y = op_index_output_stride_y;
+        let length = op_index_length;
+
+        if workgroup_id < length{
+            let input_id  =    dim_index * input_stride_y  + workgroup_id * input_stride_x;
+            let output_id = output_index * output_stride_y + workgroup_id * output_stride_x;
+            GET_INDEX1(op_index_input,op_index_input_layout1, input_id, pos1_is_valid, pos1_id)
+            if(pos1_is_valid){
+                let val = BF16_LOAD(v_input2, pos1_id);
+                BF16_STORE_ATOMIC(v_dest, output_id, val);
+            }
+            else{
+                BF16_STORE_ATOMIC(v_dest, output_id, 0.0);
+            }
+        }
+    }
+}
+#else
+@compute
+@workgroup_size(8,8,1)
+fn index_select_u32(@builtin(global_invocation_id) global_id: vec3<u32>) {
+
+    let workgroup_id = global_id.x;
+    let output_index = global_id.y;
+
+    GET_INDEX2(op_index_input,op_index_input_layout1, output_index, pos2_is_valid, pos2_id)
+    if(pos2_is_valid){
+        let dim_index = v_input1_u32[pos2_id];
+
         let input_stride_x = op_index_input_stride_x;
         let input_stride_y = op_index_input_stride_y;
         let output_stride_x = op_index_output_stride_x;
@@ -38,3 +76,4 @@ fn index_select_u32(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
 }
+#endif

@@ -1,4 +1,5 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
 
 LOAD_INFO(op_rms_norm, 7)
 #define oop_rms_norm_contiguous_workgroup_count              op_rms_norm[0]
@@ -9,26 +10,65 @@ LOAD_INFO(op_rms_norm, 7)
 #define oop_rms_norm_contiguous_eps                          bitcast<f32>(op_rms_norm[5])
 
 #define oop_rms_norm_contiguous_input3_offset                op_rms_norm[6]
-var<workgroup> sharedSums: array<DTYPE, 64>; 
-var<workgroup> sharedMean: f32; 
-var<workgroup> sharedNorm: f32; 
+
+// Shared partial-sum array. For bf16 we accumulate in f32 (BF16 storage,
+// f32 compute) — reductions in BF16 would lose too much precision for
+// large tensors. For all other dtypes we keep the existing DTYPE-typed
+// array.
+#ifdef bf16
+var<workgroup> sharedSums: array<f32, 64>;
+#else
+var<workgroup> sharedSums: array<DTYPE, 64>;
+#endif
+var<workgroup> sharedMean: f32;
+var<workgroup> sharedNorm: f32;
 
 @compute
 @workgroup_size(64,1,1)
 fn rms_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgroup_id) output_id3: vec3<u32>,) {
     let tid = local_id.x;
     let output_index = output_id3.y;
-    
+
     //Start Index of the Elements to Reduce
     let length = oop_rms_norm_contiguous_length; //length of the elements to reduce
     let start_index = output_index * length;
     let start_index1 = start_index + oop_rms_norm_contiguous_input1_offset;
     let start_index2 = oop_rms_norm_contiguous_input2_offset;
 
-    //We split the Reduction into 64 threads -> find the sub region we need to reduce over 
+    //We split the Reduction into 64 threads -> find the sub region we need to reduce over
     let start = tid * oop_rms_norm_contiguous_workgroup_size;
     let end = min(length, (tid + 1) * oop_rms_norm_contiguous_workgroup_size);
 
+#ifdef bf16
+    // BF16 path: load BF16 inputs as f32, accumulate sum-of-squares in
+    // f32 shared memory, normalize and write through BF16_STORE_ATOMIC.
+    var sum: f32 = 0.0;
+    for (var i = start; i < end; i++){
+        let v = BF16_LOAD(v_input1, start_index1 + i);
+        sum += v*v;
+    }
+    sharedSums[tid] = sum;
+
+    workgroupBarrier();
+
+    if (tid == 0){
+        let cnt = oop_rms_norm_contiguous_workgroup_count;
+        var s: f32 = 0.0;
+        for (var i = 0u; i < cnt; i++){
+            s += sharedSums[i];
+        }
+        let mean = s / f32(length);
+        sharedMean = sqrt(mean + oop_rms_norm_contiguous_eps);
+    }
+
+    workgroupBarrier();
+
+    for (var i = start; i < end; i++){
+        let x = BF16_LOAD(v_input1, start_index1 + i);
+        let w = BF16_LOAD(v_input2, start_index2 + i);
+        BF16_STORE_ATOMIC(v_dest, start_index + i, x / sharedMean * w);
+    }
+#else
     //Now Reduce from start to end
     var sum = ZERO;
     for (var i = start; i < end; i++){
@@ -36,12 +76,12 @@ fn rms_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgrou
         sum += v*v;
     }
     sharedSums[tid] = sum;
-        
+
     workgroupBarrier();
 
     //This is not optimal (only 1 of 64 threads sums the partial result of each thread)
     //TODO: Either use multiple threads for the sum(e.g. first 32 threads, then 16, then 8, ...)
-    //      or let one thread calculate multiple outputs in sharedSums, and then let multiple threads sum the partial results of one output(like in matmul1x64b) 
+    //      or let one thread calculate multiple outputs in sharedSums, and then let multiple threads sum the partial results of one output(like in matmul1x64b)
     if (tid == 0){
         let cnt = oop_rms_norm_contiguous_workgroup_count;
         //Finnaly Sum of all worker threads:
@@ -49,7 +89,7 @@ fn rms_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgrou
         for (var i = 0u; i < cnt; i++){
             sum +=  sharedSums[i];
         }
-        let mean = f32(sum) / f32(length);    
+        let mean = f32(sum) / f32(length);
         let m = sqrt(mean + oop_rms_norm_contiguous_eps);
         sharedMean = m;
     }
@@ -57,25 +97,29 @@ fn rms_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgrou
     workgroupBarrier();
 
     for (var i = start; i < end; i++){
-#ifdef f32 
+#ifdef f32
         v_dest[start_index + i] = v_input1[start_index1 + i] / sharedMean * v_input2[start_index2 + i];
-#endif 
-#ifdef u32 
+#endif
+#ifdef u32
         v_dest[start_index + i] = u32(f32(v_input1[start_index1 + i]) / sharedMean * f32(v_input2[start_index2 + i]));
-#endif  
+#endif
     }
-
+#endif
 }
 
 
-var<workgroup> sharedSumsSquared: array<DTYPE, 64>; 
+#ifdef bf16
+var<workgroup> sharedSumsSquared: array<f32, 64>;
+#else
+var<workgroup> sharedSumsSquared: array<DTYPE, 64>;
+#endif
 
 @compute
 @workgroup_size(64,1,1)
 fn layer_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgroup_id) output_id3: vec3<u32>,) {
     let tid = local_id.x;
     let output_index = output_id3.y;
-    
+
     //Start Index of the Elements to Reduce
     let length = oop_rms_norm_contiguous_length; //length of the elements to reduce
     let start_index = output_index * length;
@@ -83,10 +127,46 @@ fn layer_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgr
     let start_index2 = oop_rms_norm_contiguous_input2_offset;
     let start_index3 = oop_rms_norm_contiguous_input3_offset;
 
-    //We split the Reduction into 64 threads -> find the sub region we need to reduce over 
+    //We split the Reduction into 64 threads -> find the sub region we need to reduce over
     let start = tid * oop_rms_norm_contiguous_workgroup_size;
     let end = min(length, (tid + 1) * oop_rms_norm_contiguous_workgroup_size);
 
+#ifdef bf16
+    var sum: f32 = 0.0;
+    var sum_squared: f32 = 0.0;
+    for (var i = start; i < end; i++){
+        let v = BF16_LOAD(v_input1, start_index1 + i);
+        sum_squared += v*v;
+        sum += v;
+    }
+    sharedSums[tid] = sum;
+    sharedSumsSquared[tid] = sum_squared;
+
+    workgroupBarrier();
+
+    if (tid == 0){
+        let cnt = oop_rms_norm_contiguous_workgroup_count;
+        var s: f32 = 0.0;
+        var ss: f32 = 0.0;
+        for (var i = 0u; i < cnt; i++){
+            s  += sharedSums[i];
+            ss += sharedSumsSquared[i];
+        }
+        let mean_x = s / f32(length);
+        let norm_x = (ss / f32(length)) - mean_x * mean_x;
+        sharedMean = mean_x;
+        sharedNorm = sqrt(norm_x + oop_rms_norm_contiguous_eps);
+    }
+
+    workgroupBarrier();
+
+    for (var i = start; i < end; i++){
+        let x  = BF16_LOAD(v_input1, start_index1 + i);
+        let w  = BF16_LOAD(v_input2, start_index2 + i);
+        let b  = BF16_LOAD(v_input3, start_index3 + i);
+        BF16_STORE_ATOMIC(v_dest, start_index + i, ((x - sharedMean) / sharedNorm) * w + b);
+    }
+#else
     //Now Reduce from start to end
     var sum = ZERO;
     var sum_squared = ZERO;
@@ -97,12 +177,12 @@ fn layer_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgr
     }
     sharedSums[tid] = sum;
     sharedSumsSquared[tid] = sum_squared;
-        
+
     workgroupBarrier();
 
     //This is not optimal (only 1 of 64 threads sums the partial result of each thread)
     //TODO: Either use multiple threads for the sum(e.g. first 32 threads, then 16, then 8, ...)
-    //      or let one thread calculate multiple outputs in sharedSums, and then let multiple threads sum the partial results of one output(like in matmul1x64b) 
+    //      or let one thread calculate multiple outputs in sharedSums, and then let multiple threads sum the partial results of one output(like in matmul1x64b)
     if (tid == 0){
         let cnt = oop_rms_norm_contiguous_workgroup_count;
         //Finnaly Sum of all worker threads:
@@ -122,12 +202,12 @@ fn layer_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgr
     workgroupBarrier();
 
     for (var i = start; i < end; i++){
-#ifdef f32 
+#ifdef f32
         v_dest[start_index + i] = ((v_input1[start_index1 + i] - sharedMean) / sharedNorm) * v_input2[start_index2 + i] + v_input3[start_index3 + i];
-#endif 
-#ifdef u32 
+#endif
+#ifdef u32
         v_dest[start_index + i] = u32(((f32(v_input1[start_index1 + i]) - sharedMean) / sharedNorm) * f32(v_input2[start_index2 + i]) + f32(v_input3[start_index3 + i]));
-#endif  
+#endif
     }
-
+#endif
 }
