@@ -12,14 +12,17 @@
 //!   sliding/full type). Donors stash post-cache `(k, v)` in a shared
 //!   store; receivers skip their own k_proj/v_proj/k_norm/RoPE and
 //!   read from the donor entry instead.
+//! - **LaurelBlock** — low-rank residual augmentation merged into the
+//!   attention output via `(attn + laurel) * (1/√2)`.
+//! - **layer_scalar** — per-layer learned gain on the residual stream.
+//!   Required on Gemma 4 E2B; without it `abs_max` runs away.
+//! - **activation sparsity** (Gaussian-topk) — pre-activation gate
+//!   thresholding using `mean+std*z` with `z = sqrt(2)*erfinv(2p-1)`.
 //!
 //! **Not yet ported** (gated off via `Gemma4TextConfig::disable_altup`,
-//! `disable_laurel`, `disable_per_layer_input_gate`):
+//! `disable_per_layer_input_gate`):
 //! - Per-Layer Embeddings (PLE)
 //! - AltUp (Alternating Updates)
-//! - LAuReL (Learned Augmented Residual Layer)
-//! - layer_scalar
-//! - activation sparsity (Gaussian-topk)
 //!
 //! Output won't match Gemma 4 reference exactly with the auxiliary
 //! towers off — this scaffold exists to exercise the QMatMul + GGUF
@@ -148,11 +151,28 @@ struct MLP {
     up_proj: QMatMul,
     down_proj: QMatMul,
     act_fn: Activation,
+    /// `icdf_normal(sparsity)`. `0.0` disables sparsity for this layer.
+    /// When non-zero, gate goes through a Gaussian top-K threshold:
+    /// `mean+std*z`-based ReLU before the activation. Mirrors HF's
+    /// `Gemma3nTextMLP.gaussian_topk`.
+    sparsity_threshold_z: f64,
 }
 
 impl MLP {
     fn forward_inner(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?;
+        let mut gate = self.gate_proj.forward(xs)?;
+        if self.sparsity_threshold_z != 0.0 {
+            let original_dtype = gate.dtype();
+            let gate_f32 = gate.to_dtype(DType::F32)?;
+            let mean = gate_f32.mean_keepdim(D::Minus1)?;
+            let var = gate_f32.broadcast_sub(&mean)?.sqr()?.mean_keepdim(D::Minus1)?;
+            let std = var.sqrt()?;
+            let threshold = (mean + (std * self.sparsity_threshold_z)?)?;
+            let sparse = gate_f32.broadcast_sub(&threshold)?;
+            let zero = Tensor::zeros_like(&sparse)?;
+            let sparse = sparse.maximum(&zero)?;
+            gate = sparse.to_dtype(original_dtype)?;
+        }
         let lhs = gate.apply(&self.act_fn)?;
         let up = self.up_proj.forward(xs)?;
         self.down_proj.forward(&(lhs * up)?)
@@ -161,6 +181,44 @@ impl MLP {
 
 impl Module for MLP {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> { self.forward_inner(xs) }
+}
+
+/// Cheap erfinv approximation accurate to ~5e-4 across [-1, 1]. Sufficient
+/// for the sparsity threshold which is itself a multiplicative factor
+/// applied to a noisy mean+std estimate. Source: Winitzki, "A handy
+/// approximation for the error function and its inverse" (2008).
+fn erfinv_approx(x: f64) -> f64 {
+    if x.abs() >= 1.0 {
+        return x.signum() * f64::INFINITY;
+    }
+    let a = 0.147;
+    let ln = (1.0 - x * x).ln();
+    let term1 = 2.0 / (std::f64::consts::PI * a) + ln / 2.0;
+    let term2 = ln / a;
+    let inner = (term1 * term1 - term2).sqrt() - term1;
+    x.signum() * inner.sqrt()
+}
+
+// ── LaurelBlock (Learned Augmented Residual Layer) ─────────────────────────
+//
+// Low-rank residual augmentation applied alongside the attention output.
+// Mirrors HF `Gemma3nTextLaurelBlock`: project hidden_size → laurel_rank →
+// hidden_size, RmsNorm, add to the attention output before the residual.
+
+#[derive(Debug, Clone)]
+struct LaurelBlock {
+    linear_left: QMatMul,
+    linear_right: QMatMul,
+    post_laurel_norm: RmsNorm,
+}
+
+impl LaurelBlock {
+    fn forward(&self, hidden: &Tensor) -> Result<Tensor> {
+        let l = self.linear_left.forward(hidden)?;
+        let l = self.linear_right.forward(&l)?;
+        let n = self.post_laurel_norm.forward(&l)?;
+        hidden + n
+    }
 }
 
 // ── Attention ───────────────────────────────────────────────────────────────
@@ -317,6 +375,17 @@ struct DecoderLayer {
     post_attention_layernorm: RmsNorm,
     pre_feedforward_layernorm: RmsNorm,
     post_feedforward_layernorm: RmsNorm,
+    /// Laurel low-rank residual augmentation. `None` when
+    /// `cfg.laurel_rank == 0` or `cfg.disable_laurel`.
+    laurel: Option<LaurelBlock>,
+    /// `1/√2`, applied to `(attn_gated + laurel_out)` so the merged
+    /// residual stays at unit-ish variance.
+    inv_sqrt_2: f64,
+    /// Per-layer learned scalar. `None` when the GGUF doesn't carry
+    /// this tensor — without it the residual stream loses its
+    /// per-layer trained gain (`abs_max` will run away on Gemma 4
+    /// E2B). Read from `blk.{i}.layer_scalar`.
+    layer_scalar: Option<Tensor>,
 }
 
 impl DecoderLayer {
@@ -329,22 +398,39 @@ impl DecoderLayer {
         shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.input_layernorm.forward(xs)?;
-        let xs = self.self_attn.forward(
-            &xs,
+        let normed_input = self.input_layernorm.forward(xs)?;
+        let attn = self.self_attn.forward(
+            &normed_input,
             attention_mask,
             sliding_attention_mask,
             seqlen_offset,
             shared_kv_store,
         )?;
-        let xs = self.post_attention_layernorm.forward(&xs)?;
-        let xs = (xs + residual)?;
+        let attn = self.post_attention_layernorm.forward(&attn)?;
+        // LaurelBlock merges with the attention output before the
+        // first residual add: `attn = (attn + laurel(normed_input)) * inv_sqrt_2`.
+        let attn = if let Some(laurel) = &self.laurel {
+            let l = laurel.forward(&normed_input)?;
+            ((attn + l)? * self.inv_sqrt_2)?
+        } else {
+            attn
+        };
+        let xs = (attn + residual)?;
 
         let residual = &xs;
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
         let mlp_out = self.mlp.forward(&normed)?;
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
-        residual + mlp_out
+        let xs = (residual + mlp_out)?;
+
+        // Per-layer learned gain (Gemma 4 specifically — initialised to
+        // 1.0 and trained per layer). Without this multiply the
+        // residual stream `abs_max` runs away on E2B.
+        if let Some(scalar) = &self.layer_scalar {
+            xs.broadcast_mul(scalar)
+        } else {
+            Ok(xs)
+        }
     }
 
     fn clear_kv_cache(&mut self) { self.self_attn.clear_kv_cache(); }
@@ -480,7 +566,19 @@ impl ModelWeights {
             let gate_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?)?;
             let up_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_up.weight"), device)?)?;
             let down_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_down.weight"), device)?)?;
-            let mlp = MLP { gate_proj, up_proj, down_proj, act_fn: cfg.hidden_activation };
+            let sparsity = cfg.activation_sparsity_at(layer_idx);
+            let sparsity_threshold_z = if sparsity > 0.0 && sparsity < 1.0 {
+                std::f64::consts::SQRT_2 * erfinv_approx(2.0 * sparsity - 1.0)
+            } else {
+                0.0
+            };
+            let mlp = MLP {
+                gate_proj,
+                up_proj,
+                down_proj,
+                act_fn: cfg.hidden_activation,
+                sparsity_threshold_z,
+            };
 
             let input_layernorm = RmsNorm::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_norm.weight"), device)?,
@@ -499,6 +597,37 @@ impl ModelWeights {
                 cfg.rms_norm_eps,
             )?;
 
+            // LaurelBlock — gated on cfg.laurel_rank > 0 and not
+            // disabled. Tensors are optional; if any one is missing
+            // (some publications drop laurel), fall back to None.
+            let laurel = if cfg.laurel_rank > 0 && !cfg.disable_laurel {
+                let mut try_laurel = || -> Result<LaurelBlock> {
+                    let linear_left = QMatMul::from_qtensor(
+                        ct.tensor(reader, &format!("{prefix}.laurel_l.weight"), device)?,
+                    )?;
+                    let linear_right = QMatMul::from_qtensor(
+                        ct.tensor(reader, &format!("{prefix}.laurel_r.weight"), device)?,
+                    )?;
+                    let post_laurel_norm = RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{prefix}.post_laurel_norm.weight"), device)?,
+                        cfg.rms_norm_eps,
+                    )?;
+                    Ok(LaurelBlock { linear_left, linear_right, post_laurel_norm })
+                };
+                try_laurel().ok()
+            } else {
+                None
+            };
+
+            // Per-layer scalar — single f32 [1] tensor at `blk.{i}.layer_scalar`.
+            // Optional: publications without this tensor silently skip
+            // the multiply (Gemma 4 E2B's residual stream needs it,
+            // older Gemma generations don't have it).
+            let layer_scalar = ct
+                .tensor(reader, &format!("{prefix}.layer_scalar"), device)
+                .ok()
+                .and_then(|t| t.dequantize(device).ok());
+
             layers.push(DecoderLayer {
                 self_attn,
                 mlp,
@@ -506,6 +635,9 @@ impl ModelWeights {
                 post_attention_layernorm,
                 pre_feedforward_layernorm,
                 post_feedforward_layernorm,
+                laurel,
+                inv_sqrt_2: (2.0_f64).powf(-0.5),
+                layer_scalar,
             });
         }
 
