@@ -28,30 +28,43 @@ enable f16;
 #ifdef bf16
 // BF16 has no native WGSL type. We pack 2 BF16 elements per u32 word
 // and operate on them as f32 in the kernel via the BF16_LOAD /
-// BF16_STORE macros below. DTYPE is `u32` so `array<DTYPE>` and the
-// raw `v_input1[i]` indexing read the WORD (not the BF16 element).
-// Kernels that opt into bf16 must use BF16_LOAD / BF16_STORE for
-// per-element access.
+// BF16_LOAD_ATOMIC / BF16_STORE_ATOMIC macros below. DTYPE is `u32` so
+// `array<DTYPE>` and the raw `v_input1[i]` indexing read the WORD
+// (not the BF16 element). Kernels that opt into bf16 must use the
+// BF16_* macros for per-element access.
 //
 // The conversion is exact: BF16 is "f32 with the bottom 16 mantissa
 // bits zeroed", so f32→bf16 is a truncate (with rounding for write
 // stability) and bf16→f32 is `bits << 16u`.
+//
+// Concurrency model: two threads writing adjacent BF16 elements
+// (e.g. id=0 and id=1) target the same u32 word. To make the
+// halfword-pack race-free, the bf16 destination binding (`v_dest`) is
+// declared `array<atomic<u32>>` and BF16_STORE_ATOMIC uses a
+// compare-and-swap loop. Input bindings (`v_input1`/`v_input2`) stay
+// non-atomic — they're read-only, so plain word reads are safe.
 #define DTYPE u32
 
-// Read one BF16 element from a u32-packed `array<u32>` buffer at
-// element index `idx`. Returns f32 (the natural compute type).
+// Read one BF16 element from a NON-ATOMIC u32-packed `array<u32>`
+// buffer at element index `idx`. Returns f32 (the natural compute
+// type). Use this for input bindings.
 //
 // `(idx & 1u) * 16u` selects the upper or lower halfword of the
 // u32 word at `idx / 2u`; mask to 16 bits, then shift into the
 // high 16 bits of an f32 via `bits << 16u` and `bitcast<f32>`.
 #define BF16_LOAD(buf, idx) bitcast<f32>(((((buf)[(idx) / 2u]) >> (((idx) & 1u) * 16u)) & 0xFFFFu) << 16u)
 
-// Write one BF16 element. `idx` is the element index in the
-// destination buffer; `val` is f32. Round-to-nearest-even on the
-// f32 → BF16 truncation (round bias = 0x7FFF + LSB of the kept
-// mantissa half). Read-modify-write the u32 word so the sibling
-// halfword survives.
-#pp_begin BF16_STORE(buf, idx, val)
+// Read one BF16 element from an ATOMIC u32 buffer (typically v_dest
+// for inplace ops). Uses atomicLoad to satisfy WGSL's atomic-binding
+// access rules. Returns f32.
+#define BF16_LOAD_ATOMIC(buf, idx) bitcast<f32>(((atomicLoad(&(buf)[(idx) / 2u]) >> (((idx) & 1u) * 16u)) & 0xFFFFu) << 16u)
+
+// Write one BF16 element to an ATOMIC u32 buffer. `idx` is the
+// element index; `val` is f32. Round-to-nearest-even on f32→BF16
+// truncation (round bias = 0x7FFF + LSB of the kept mantissa half).
+// Compare-and-swap loop ensures the sibling halfword survives a
+// concurrent write from another thread targeting the same u32 word.
+#pp_begin BF16_STORE_ATOMIC(buf, idx, val)
     let _bf16_bits = bitcast<u32>(val);
     let _bf16_lsb = (_bf16_bits >> 16u) & 1u;
     let _bf16_rounding = 0x7FFFu + _bf16_lsb;
@@ -59,11 +72,25 @@ enable f16;
     let _bf16_word_idx = (idx) / 2u;
     let _bf16_shift = ((idx) & 1u) * 16u;
     let _bf16_mask = 0xFFFFu << _bf16_shift;
-    (buf)[_bf16_word_idx] = ((buf)[_bf16_word_idx] & ~_bf16_mask) | (_bf16_short << _bf16_shift);
+    let _bf16_value = _bf16_short << _bf16_shift;
+    loop {
+        let _bf16_old = atomicLoad(&(buf)[_bf16_word_idx]);
+        let _bf16_new = (_bf16_old & ~_bf16_mask) | _bf16_value;
+        let _bf16_cas = atomicCompareExchangeWeak(&(buf)[_bf16_word_idx], _bf16_old, _bf16_new);
+        if (_bf16_cas.exchanged) { break; }
+    }
 #pp_end
 #endif
 
 
+#ifdef bf16
+// BF16 path: v_dest is atomic so concurrent halfword writes don't race.
+// The non-atomic alias views (v_dest_4 / v_dest_u32 / etc.) are not
+// emitted in bf16 codegen — bf16 kernels access destination data
+// exclusively through the atomic v_dest plus BF16_*_ATOMIC macros.
+@group(0) @binding(0)
+var<storage, read_write> v_dest: array<atomic<u32>>;
+#else
 @group(0) @binding(0)
 var<storage, read_write> v_dest: array<DTYPE>;
 
@@ -81,6 +108,7 @@ var<storage, read_write> v_dest_i64: array<i64>;
 
 @group(0) @binding(0)
 var<storage, read_write> v_dest_f64: array<f64>;
+#endif
 
 
 

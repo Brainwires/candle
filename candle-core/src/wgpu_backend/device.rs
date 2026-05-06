@@ -101,7 +101,7 @@ impl WgpuDevice {
             DType::I64 => self.inner_device().is_dtype_available(dtype.into()),
             DType::F64 => self.inner_device().is_dtype_available(dtype.into()),
             DType::F16 => self.inner_device().is_dtype_available(dtype.into()),
-            DType::BF16 => false,
+            DType::BF16 => self.inner_device().is_dtype_available(dtype.into()),
             DType::F8E4M3 => false,
             DType::I16 => false,
             DType::I32 => false,

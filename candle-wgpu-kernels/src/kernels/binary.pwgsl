@@ -1,5 +1,42 @@
 #include "util.pwgsl"
 
+#ifdef bf16
+// BF16 path: storage is u32-packed (2 bf16 per word), compute in f32.
+// Read inputs via BF16_LOAD, compute in f32, write via BF16_STORE.
+fn set_binary(operation : u32, id : u32, x : f32, y : f32){
+    var result: f32 = 0.0;
+    switch(operation){
+        case 0u{
+            result = y;
+        }
+        case 1u{ //add
+            result = x + y;
+        }
+        case 2u{ //mult
+            result = x * y;
+        }
+        case 3u{ //minus
+            result = x - y;
+        }
+        case 4u{ //div
+            result = x / y;
+        }
+        case 5u{ //max
+            result = max(x, y);
+        }
+        case 6u{ //min
+            result = min(x, y);
+        }
+        case 7u{ //powf
+            result = pow(x, y);
+        }
+        default{
+
+        }
+    }
+    BF16_STORE_ATOMIC(v_dest, id, result);
+}
+#else
 fn set_binary(operation : u32, id : u32, x : DTYPE, y : DTYPE){
     switch(operation){
         case 0u{
@@ -23,7 +60,7 @@ fn set_binary(operation : u32, id : u32, x : DTYPE, y : DTYPE){
         case 6u{ //min
             v_dest[id] = min(x, y);
         }
-#ifdef f32        
+#ifdef f32
         case 7u{ //powf
             v_dest[id] = pow(x, y);
         }
@@ -33,6 +70,7 @@ fn set_binary(operation : u32, id : u32, x : DTYPE, y : DTYPE){
         }
     }
 }
+#endif
 
 
 
@@ -56,6 +94,19 @@ LOAD_INFO(op_binary_info, 3)
 
 LOAD_INFO_UNKNOWN_SIZE(op_binary, 0)
 
+// Helper macro: read element at `idx` from buffer `buf`. For bf16 the
+// buffer is u32-packed; inputs go through BF16_LOAD (non-atomic) and
+// the destination read goes through BF16_LOAD_ATOMIC because v_dest
+// is bound as `array<atomic<u32>>` in the bf16 codepath. Lets the
+// dispatch entrypoints stay dtype-uniform.
+#ifdef bf16
+#define BIN_LOAD(buf, idx) BF16_LOAD(buf, idx)
+#define BIN_LOAD_DEST(idx) BF16_LOAD_ATOMIC(v_dest, idx)
+#else
+#define BIN_LOAD(buf, idx) (buf)[idx]
+#define BIN_LOAD_DEST(idx) v_dest[idx]
+#endif
+
 @compute
 @workgroup_size(64,1,1)
 fn binary_buffer_from_buffer(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -65,7 +116,7 @@ fn binary_buffer_from_buffer(@builtin(global_invocation_id) global_id: vec3<u32>
     GET_INDEX2(op_binary,op_binary_input1_layout, id, pos2_is_valid, pos2_id)
 
     if(pos1_is_valid){
-        set_binary(op_binary_operation, id, v_input1[pos1_id], v_input2[pos2_id]);
+        set_binary(op_binary_operation, id, BIN_LOAD(v_input1, pos1_id), BIN_LOAD(v_input2, pos2_id));
     }
 }
 
@@ -75,9 +126,9 @@ fn binary_buffer_from_buffer_same_stride(@builtin(global_invocation_id) global_i
     let id = global_id.x + select(0u, global_id.y * 65535 * 64,USE_Z);
 
     GET_INDEX1(op_binary,op_binary_input1_layout, id, pos1_is_valid, pos1_id);
-    
+
     if(pos1_is_valid){
-        set_binary(op_binary_operation, id, v_input1[pos1_id], v_input2[pos1_id]);
+        set_binary(op_binary_operation, id, BIN_LOAD(v_input1, pos1_id), BIN_LOAD(v_input2, pos1_id));
     }
 }
 
@@ -89,7 +140,7 @@ fn binary_buffer_from_buffer_contiguous_both(@builtin(global_invocation_id) glob
     if (id >= op_binary_contiguous_both_input1_length){
         return;
     }
-    set_binary(op_binary_contiguous_both_operation, id, v_input1[id + op_binary_contiguous_both_input1_offset], v_input2[id + op_binary_contiguous_both_input2_offset]);
+    set_binary(op_binary_contiguous_both_operation, id, BIN_LOAD(v_input1, id + op_binary_contiguous_both_input1_offset), BIN_LOAD(v_input2, id + op_binary_contiguous_both_input2_offset));
 }
 
 @compute
@@ -100,7 +151,7 @@ fn binary_buffer_inplace1_contiguous_both(@builtin(global_invocation_id) global_
         return;
     }
     let offset1 = op_binary_contiguous_both_input1_offset; //is only used so that the shader compiles if op_binary_contiguous_both_input1_offset is set
-    set_binary(op_binary_contiguous_both_operation, id, v_dest[id], v_input1[id + op_binary_contiguous_both_input2_offset]);
+    set_binary(op_binary_contiguous_both_operation, id, BIN_LOAD_DEST(id), BIN_LOAD(v_input1, id + op_binary_contiguous_both_input2_offset));
 }
 
 @compute
@@ -111,5 +162,5 @@ fn binary_buffer_inplace2_contiguous_both(@builtin(global_invocation_id) global_
         return;
     }
     let offset2 = op_binary_contiguous_both_input2_offset; //is only used so that the shader compiles if op_binary_contiguous_both_input2_offset is set
-    set_binary(op_binary_contiguous_both_operation, id, v_input1[id + op_binary_contiguous_both_input1_offset], v_dest[id]);
+    set_binary(op_binary_contiguous_both_operation, id, BIN_LOAD(v_input1, id + op_binary_contiguous_both_input1_offset), BIN_LOAD_DEST(id));
 }
