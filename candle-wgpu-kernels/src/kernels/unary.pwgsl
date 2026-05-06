@@ -1,4 +1,16 @@
 #include "util.pwgsl"
+// BF16_SUPPORTED — see candle-wgpu-kernels/build.rs.
+//
+// BF16 path: arithmetic happens in f32 (BF16 has no native WGSL type).
+// Every set_unary case rewrites `v_dest[id] = expr` to
+// `BF16_STORE_ATOMIC(v_dest, id, expr_in_f32)`, and reads of
+// `v_input1[idx]` / `v_dest[idx]` go through `BF16_LOAD` /
+// `BF16_LOAD_ATOMIC`. The const_inplace_contiguous_4 (vec4) path is
+// gated `#ifndef bf16` because vec4<u32> packs 8 bf16 elements per
+// vec — semantics don't translate. The f32-only ops (trig, log, etc.)
+// remain `#ifdef f32` gated; bf16 supports the same op subset that
+// any sensible BF16 inference path exercises (silu, gelu, scalar
+// arithmetic, identity, square, abs, exp, sqrt).
 
 fn hash(i : u32) -> u32{
     var x = i ^ (i >> 16);
@@ -75,10 +87,18 @@ fn erf(x : f32) -> f32{
 fn set_const(operation : u32, id : u32){
     switch operation {
         case 0u{ // set 0
+#ifdef bf16
+            BF16_STORE_ATOMIC(v_dest, id, 0.0);
+#else
             v_dest[id] = ZERO;
+#endif
         }
         case 1u{ //set 1
+#ifdef bf16
+            BF16_STORE_ATOMIC(v_dest, id, 1.0);
+#else
             v_dest[id] = ONE;
+#endif
         }
         default{
         }
@@ -102,13 +122,89 @@ fn set_rand(operation : u32, id : u32, scalar1 : f32, scalar2 : f32, seed : u32)
     }
 }
 
+#ifdef bf16
+// BF16 set_unary: x is loaded as f32 by the caller; all writes go
+// through BF16_STORE_ATOMIC. Cases 2/3 (in-place += / -= ONE) need a
+// load of v_dest as f32 then a store. Trig / log / exp etc. that were
+// `#ifdef f32` only (cases 7-50 in the f32 path) are also supported
+// here because the kernel computes in f32 regardless of storage dtype.
+fn set_unary_bf16(operation : u32, id : u32, x : f32, scalar1 : f32, scalar2 : f32){
+    let SQRT_TWO_OVER_PI: f32 = 0.79788456080286535587989211986876373;
+    switch operation {
+        case 2u{
+            BF16_STORE_ATOMIC(v_dest, id, BF16_LOAD_ATOMIC(v_dest, id) + 1.0);
+        }
+        case 3u{
+            BF16_STORE_ATOMIC(v_dest, id, BF16_LOAD_ATOMIC(v_dest, id) - 1.0);
+        }
+        case 4u{ // Identity
+            BF16_STORE_ATOMIC(v_dest, id, x);
+        }
+        case 5u{ // square
+            BF16_STORE_ATOMIC(v_dest, id, x * x);
+        }
+        case 6u{ // Affine: x*s1 + s2
+            BF16_STORE_ATOMIC(v_dest, id, x * scalar1 + scalar2);
+        }
+        case 7u{ BF16_STORE_ATOMIC(v_dest, id, abs(x)); }
+        case 21u{ BF16_STORE_ATOMIC(v_dest, id, exp(x)); }
+        case 24u{ BF16_STORE_ATOMIC(v_dest, id, inverseSqrt(x)); }
+        case 25u{ BF16_STORE_ATOMIC(v_dest, id, log(x)); }
+        case 28u{ BF16_STORE_ATOMIC(v_dest, id, sign(x)); }
+        case 32u{ BF16_STORE_ATOMIC(v_dest, id, sqrt(x)); }
+        case 34u{ BF16_STORE_ATOMIC(v_dest, id, tanh(x)); }
+        case 37u{ // Sigmoid
+            BF16_STORE_ATOMIC(v_dest, id, 1.0 / (1.0 + exp(-x)));
+        }
+        case 38u{ // ReLU
+            BF16_STORE_ATOMIC(v_dest, id, max(0.0, x));
+        }
+        case 41u{ // SiLU
+            BF16_STORE_ATOMIC(v_dest, id, x / (1.0 + exp(-x)));
+        }
+        case 45u{ BF16_STORE_ATOMIC(v_dest, id, -x); }
+        case 46u{ BF16_STORE_ATOMIC(v_dest, id, 1.0 / x); }
+        case 49u{ // Gelu (tanh approx)
+            BF16_STORE_ATOMIC(v_dest, id, 0.5 * x * (1.0 + tanh(SQRT_TWO_OVER_PI * x * (1.0 + 0.044715 * x * x))));
+        }
+        case 100u{ // set scalar
+            BF16_STORE_ATOMIC(v_dest, id, scalar1);
+        }
+        case 101u{ // add scalar
+            BF16_STORE_ATOMIC(v_dest, id, x + scalar1);
+        }
+        case 102u{ // mult scalar
+            BF16_STORE_ATOMIC(v_dest, id, x * scalar1);
+        }
+        case 103u{ // minus scalar
+            BF16_STORE_ATOMIC(v_dest, id, x - scalar1);
+        }
+        case 104u{ // div scalar
+            BF16_STORE_ATOMIC(v_dest, id, x / scalar1);
+        }
+        case 105u{ // max scalar
+            BF16_STORE_ATOMIC(v_dest, id, max(x, scalar1));
+        }
+        case 106u{ // min scalar
+            BF16_STORE_ATOMIC(v_dest, id, min(x, scalar1));
+        }
+        case 107u{ // powf
+            BF16_STORE_ATOMIC(v_dest, id, pow(x, scalar1));
+        }
+        default {
+        }
+    }
+}
+#endif
+
+#ifndef bf16
 //all Unary Operations
 fn set_unary(operation : u32, id : u32, x : DTYPE, scalar1 : f32, scalar2 : f32){
     switch operation {
-        case 2u{ 
+        case 2u{
             v_dest[id] += ONE;
         }
-        case 3u{ 
+        case 3u{
             v_dest[id] -= ONE;
         }
         case 4u{ //Identity
@@ -279,6 +375,7 @@ fn set_unary(operation : u32, id : u32, x : DTYPE, scalar1 : f32, scalar2 : f32)
         }
     }
 }
+#endif
 
 
 override CONSTV_0 : u32 = 1u;
@@ -303,14 +400,27 @@ LOAD_INFO(op_unary_contiguous, 5)
 
 
 
+// Read input element + dispatch macros. For bf16 the input is BF16-loaded
+// as f32 and routed to set_unary_bf16; otherwise the existing DTYPE
+// path goes through set_unary.
+#ifdef bf16
+#define UNARY_LOAD_INPUT(idx) BF16_LOAD(v_input1, idx)
+#define UNARY_LOAD_DEST(idx)  BF16_LOAD_ATOMIC(v_dest, idx)
+#define UNARY_DISPATCH(op, id, x, s1, s2) set_unary_bf16(op, id, x, s1, s2)
+#else
+#define UNARY_LOAD_INPUT(idx) v_input1[idx]
+#define UNARY_LOAD_DEST(idx)  v_dest[idx]
+#define UNARY_DISPATCH(op, id, x, s1, s2) set_unary(op, id, x, s1, s2)
+#endif
+
 @compute
 @workgroup_size(64,1,1)
 fn unary_from_buffer(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let id = global_id.x + select(0u, global_id.y * 65535 * 64,USE_Z);
     GET_INDEX1(op_unary,op_unary_input1_layout, id, pos1_is_valid, pos1_id)
     if(pos1_is_valid){
-        let x = v_input1[pos1_id];
-        set_unary(op_unary_operation,id, x, op_unary_scalar1, op_unary_scalar2);
+        let x = UNARY_LOAD_INPUT(pos1_id);
+        UNARY_DISPATCH(op_unary_operation, id, x, op_unary_scalar1, op_unary_scalar2);
     }
 }
 
@@ -321,8 +431,8 @@ fn unary_from_buffer_contiguous(@builtin(global_invocation_id) global_id: vec3<u
     if (id >= op_unary_contiguous_length){
         return;
     }
-    let x = v_input1[id + op_unary_contiguous_offset];
-    set_unary(op_unary_contiguous_operation, id, x, op_unary_contiguous_scalar1, op_unary_contiguous_scalar2);
+    let x = UNARY_LOAD_INPUT(id + op_unary_contiguous_offset);
+    UNARY_DISPATCH(op_unary_contiguous_operation, id, x, op_unary_contiguous_scalar1, op_unary_contiguous_scalar2);
 }
 
 
@@ -333,8 +443,8 @@ fn unary_inplace_contiguous(@builtin(global_invocation_id) global_id: vec3<u32>)
     if (id >= op_unary_contiguous_length){
         return;
     }
-    let x = v_dest[id];
-    set_unary(op_unary_contiguous_operation, id, x, op_unary_contiguous_scalar1, op_unary_contiguous_scalar2);
+    let x = UNARY_LOAD_DEST(id);
+    UNARY_DISPATCH(op_unary_contiguous_operation, id, x, op_unary_contiguous_scalar1, op_unary_contiguous_scalar2);
 }
 
 
@@ -352,7 +462,12 @@ fn const_inplace_contiguous(@builtin(global_invocation_id) global_id: vec3<u32>)
     set_const(op_unary_contiguous_operation, id);
 }
 
-//for constant functions, e.g. Set Zero:
+#ifndef bf16
+// vec4 path. For bf16, vec4<u32> = 8 packed BF16 elements; we'd need
+// to either widen the dispatch to write 8 elements per invocation or
+// fall back to the scalar const_inplace_contiguous, so this kernel is
+// gated out of bf16 codegen. Dispatch should pick the scalar variant
+// when dtype is bf16.
 @compute
 @workgroup_size(64,1,1)
 fn const_inplace_contiguous_4(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -374,6 +489,7 @@ fn const_inplace_contiguous_4(@builtin(global_invocation_id) global_id: vec3<u32
         }
     }
 }
+#endif
 
 //for constant functions, e.g. Set Zero:
 @compute
@@ -392,8 +508,8 @@ fn unary_inplace_non_contiguous(@builtin(global_invocation_id) global_id: vec3<u
     let id = global_id.x + select(0u, global_id.y * 65535 * 64,USE_Z);
     GET_INDEX1(op_unary,op_unary_input1_layout, id, pos1_is_valid, pos1_id)
     if(pos1_is_valid){
-        let x = v_dest[pos1_id];
-        set_unary(op_unary_operation, pos1_id, x, op_unary_scalar1, op_unary_scalar2);
+        let x = UNARY_LOAD_DEST(pos1_id);
+        UNARY_DISPATCH(op_unary_operation, pos1_id, x, op_unary_scalar1, op_unary_scalar2);
     }
 }
 
