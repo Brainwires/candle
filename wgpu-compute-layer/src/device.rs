@@ -638,6 +638,82 @@ impl WgpuDevice {
         Ok(WgpuStorage::new(buffer, self.clone(), dtype, size as u64))
     }
 
+    /// Eagerly allocate a real GPU buffer of `byte_size` bytes (rounded
+    /// up to a multiple of 4) and return a `WgpuStorage` referencing it.
+    ///
+    /// Unlike [`Self::alloc_uninit_size`], the underlying `wgpu::Buffer`
+    /// exists immediately rather than being created lazily on first
+    /// dispatch. This is the prerequisite for chunked uploads via
+    /// [`Self::write_to_storage_at`]: the buffer has to exist before
+    /// `queue.write_buffer` calls can target it.
+    ///
+    /// Used by the wasm chat-pwa loader to stream a 805 MB embedding
+    /// tensor from OPFS into the GPU one 64 MB chunk at a time, so
+    /// peak wasm linear memory stays bounded at one chunk regardless
+    /// of tensor size. PR #3379's regular `alloc_from_bytes` requires
+    /// the entire tensor in linear memory.
+    #[instrument(skip(self, byte_size))]
+    pub fn alloc_uninit_storage_eager(
+        &self,
+        dtype: crate::DType,
+        byte_size: u64,
+    ) -> crate::Result<WgpuStorage> {
+        // Round up to 4 bytes — wgpu requires buffer copies to be
+        // 4-byte aligned, and `search_buffer` fits this rule too.
+        let aligned = byte_size.div_ceil(4) * 4;
+        {
+            let cache = self.cache.lock().unwrap();
+            if aligned > cache.max_memory_size() {
+                return Err(crate::Error::Msg(format!(
+                    "alloc_uninit_storage_eager: requested {} bytes exceeds max {}",
+                    aligned,
+                    cache.max_memory_size(),
+                )));
+            }
+        }
+        if self.configuration.flush_gpu_before_buffer_init {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Some(index) = wgpu_functions::flush_gpu_command(self, None)? {
+                    wgpu_functions::wait_for_submission(self, index)?;
+                }
+            }
+        }
+        let mut cache = self.cache.lock().unwrap();
+        let buffer_ref = cache.alloc_eager_storage(self, aligned, true);
+        Ok(WgpuStorage::new(buffer_ref, self.clone(), dtype, aligned))
+    }
+
+    /// Write `data` into a [`WgpuStorage`] at `byte_offset`. Used together
+    /// with [`Self::alloc_uninit_storage_eager`] for chunked uploads of
+    /// large tensors. Multiple non-overlapping calls can build up a full
+    /// tensor before any compute pipeline reads it.
+    ///
+    /// The `byte_offset` and `data.len()` must both be 4-byte aligned —
+    /// the wgpu spec rejects unaligned `queue.write_buffer` calls.
+    pub fn write_to_storage_at(
+        &self,
+        storage: &WgpuStorage,
+        byte_offset: u64,
+        data: &[u8],
+    ) -> crate::Result<()> {
+        if byte_offset % 4 != 0 {
+            return Err(crate::Error::Msg(format!(
+                "write_to_storage_at: byte_offset {} not 4-byte aligned",
+                byte_offset
+            )));
+        }
+        if data.len() % 4 != 0 {
+            return Err(crate::Error::Msg(format!(
+                "write_to_storage_at: data length {} not 4-byte aligned",
+                data.len()
+            )));
+        }
+        let cache = self.cache.lock().unwrap();
+        cache.write_to_eager_storage(self, storage.buffer(), byte_offset, data);
+        Ok(())
+    }
+
     /**************** Virtual Bindgroups: ****************/
     /// Create a `BindGroupReference` for a single-output pipeline (no inputs).
     pub fn create_bind_group_input0(

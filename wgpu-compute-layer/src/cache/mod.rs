@@ -384,6 +384,61 @@ impl ModelCache {
         self.buffer_reference.insert(buffer_reference)
     }
 
+    /// Cap on a single allocation, exposed so the public
+    /// `WgpuDevice::alloc_uninit_storage_eager` can validate before
+    /// calling into `search_buffer`.
+    pub(crate) fn max_memory_size(&self) -> u64 {
+        self.max_memory_size
+    }
+
+    /// Allocate a real GPU buffer eagerly (i.e. force `search_buffer`
+    /// to materialize a `wgpu::Buffer` now rather than at first
+    /// dispatch). Returns a `BufferReferenceId` that
+    /// [`Self::write_to_eager_storage`] can target with chunked
+    /// `queue.write_buffer` calls.
+    pub(crate) fn alloc_eager_storage(
+        &mut self,
+        dev: &WgpuDevice,
+        byte_size: u64,
+        referenced_by_candle_storage: bool,
+    ) -> BufferReferenceId {
+        let buffer = self.buffers.search_buffer(
+            dev,
+            byte_size,
+            byte_size,
+            0,
+            u32::MAX - 1,
+        );
+        let buffer_reference = BufferReference::new_with_storage(
+            byte_size,
+            buffer,
+            referenced_by_candle_storage,
+        );
+        self.buffer_reference.insert(buffer_reference)
+    }
+
+    /// Stream a chunk of bytes into a previously eagerly-allocated
+    /// buffer at `byte_offset`. Multiple non-overlapping calls build
+    /// the full tensor before any pipeline reads it.
+    pub(crate) fn write_to_eager_storage(
+        &self,
+        dev: &WgpuDevice,
+        buffer_ref: BufferReferenceId,
+        byte_offset: u64,
+        data: &[u8],
+    ) {
+        let buf_ref = self
+            .buffer_reference
+            .get(&buffer_ref)
+            .expect("buffer reference id has been freed");
+        let cached_id = *buf_ref.cached_buffer_id();
+        let cached = self
+            .buffers
+            .get_buffer(&cached_id)
+            .expect("eager-allocated buffer is missing its cached entry");
+        dev.queue.write_buffer(cached.buffer(), byte_offset, data);
+    }
+
     /// returns, wheter we should stop the command_queue and delete not used buffers
     #[instrument(skip(self))]
     pub(crate) fn should_delete_unused(&mut self) -> bool {

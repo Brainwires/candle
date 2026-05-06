@@ -134,6 +134,42 @@ impl WgpuDevice {
         Ok(WgpuStorage(wgpu_storage, self.clone()))
     }
 
+    /// Eagerly allocate a real GPU buffer of `byte_size` bytes for chunked
+    /// uploads via [`Self::write_to_storage_at`]. The underlying
+    /// `wgpu::Buffer` exists immediately rather than being created at
+    /// first dispatch, so multiple `queue.write_buffer` calls can build
+    /// up a tensor before any pipeline reads it.
+    ///
+    /// Used by the chat-pwa wasm loader to stream tensor bytes from
+    /// OPFS into the GPU one chunk at a time, keeping peak wasm linear
+    /// memory bounded at one chunk.
+    #[instrument(skip(self, byte_size))]
+    pub fn alloc_uninit_storage_eager(
+        &self,
+        dtype: crate::DType,
+        byte_size: u64,
+    ) -> crate::Result<WgpuStorage> {
+        let wgpu_storage = self
+            .inner_device()
+            .alloc_uninit_storage_eager(dtype.into(), byte_size)
+            .map_err(|e| crate::Error::Msg(format!("{e}")))?;
+        Ok(WgpuStorage(wgpu_storage, self.clone()))
+    }
+
+    /// Write `data` into a previously eagerly-allocated [`WgpuStorage`]
+    /// at `byte_offset`. Both `byte_offset` and `data.len()` must be
+    /// 4-byte aligned.
+    pub fn write_to_storage_at(
+        &self,
+        storage: &WgpuStorage,
+        byte_offset: u64,
+        data: &[u8],
+    ) -> crate::Result<()> {
+        self.inner_device()
+            .write_to_storage_at(&storage.0, byte_offset, data)
+            .map_err(|e| crate::Error::Msg(format!("{e}")))
+    }
+
     pub fn allocate_zeros(&self, size_in_bytes: u32) -> crate::Result<WgpuStorage> {
         self.zeros_impl(&((size_in_bytes / 4) as usize,).into(), DType::U32)
     }
