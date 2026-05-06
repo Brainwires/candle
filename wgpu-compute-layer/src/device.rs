@@ -602,13 +602,19 @@ impl WgpuDevice {
     ///
     /// Returns a `WgpuStorage` wrapper owning a reference to the allocated buffer.
     pub fn alloc_uninit_size<T: ToU64>(&self, dtype: crate::DType, size: T) -> WgpuStorage {
-        let size = size.to_u64() * dtype.size_in_bytes() as u64;
+        let raw_size = size.to_u64() * dtype.size_in_bytes() as u64;
+        // Storage buffer bindings must be 4-byte aligned (WGPU validation
+        // rule: "Effective buffer binding size … is expected to align to 4").
+        // Sub-4-byte dtypes (BF16, F16, U8) with odd element counts produce
+        // unaligned sizes; pad up to the next 4-byte boundary so the bind
+        // group accepts the entire-buffer range.
+        let padded_size = raw_size.div_ceil(4) * 4;
         let buffer;
         {
             let mut cache = self.cache.lock().unwrap();
-            buffer = cache.create_buffer_reference(size, true);
+            buffer = cache.create_buffer_reference(padded_size, true);
         }
-        WgpuStorage::new(buffer, self.clone(), dtype, size)
+        WgpuStorage::new(buffer, self.clone(), dtype, padded_size)
     }
 
     #[instrument(skip(self, data))]

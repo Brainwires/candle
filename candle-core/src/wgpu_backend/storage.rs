@@ -83,6 +83,9 @@ impl WgpuStorage {
             crate::DType::F16 => Ok(crate::CpuStorage::F16(
                 self.0.read_from_buffer_reference_async().await?,
             )),
+            crate::DType::BF16 => Ok(crate::CpuStorage::BF16(
+                self.0.read_from_buffer_reference_async().await?,
+            )),
             _ => todo!(),
         }
     }

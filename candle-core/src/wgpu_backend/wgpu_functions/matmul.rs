@@ -1156,9 +1156,25 @@ pub fn queue_matmul_buffer(
     params: SGEMMParams,
     dtype: crate::DType,
 ) -> crate::Result<()> {
-    let alg = dev.matmul_alg.lock().unwrap().clone();
-    //let alg = dev.inner_device().with_extension::<MatmulAlgorithm, MatmulAlgorithm>(|c| c.clone()).unwrap_or(MatmulAlgorithm::MatmulX);
-    queue_matmul_buffer_alg(dev, buffer_dest, input1, input2, params, dtype, alg.clone())
+    // BF16 only has bf16 codegen for matmul1 / matmul1_m1 — the vec4
+    // (Matmul1_4) path and every sgemm tiled algorithm (Matmul7,
+    // Matmul64_64_8_8, etc.) would either fail at pipeline lookup or
+    // silently produce zeros because their kernels don't unpack the
+    // u32-packed bf16 storage. Override the device's preferred matmul
+    // alg whenever dtype is BF16 so dispatch stays inside the
+    // bf16-supported subset.
+    let alg = if matches!(dtype, crate::DType::BF16) {
+        get_matmul_naive(
+            params.m as usize,
+            params.k as usize,
+            input1.clone(),
+            input2.clone(),
+            false,
+        )
+    } else {
+        dev.matmul_alg.lock().unwrap().clone()
+    };
+    queue_matmul_buffer_alg(dev, buffer_dest, input1, input2, params, dtype, alg)
 }
 
 fn get_matmul_setting(alg: &MatmulAlgorithm) -> GenericMatmulSettings {
