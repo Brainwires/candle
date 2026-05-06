@@ -515,7 +515,18 @@ impl PerLayerEmbedding {
         let proj = self.per_layer_projection_norm.forward(&proj)?;
         let merged = match &self.embed_tokens_per_layer {
             Some(embed) => {
-                let table = embed.forward(input_ids)?;
+                // Same WGPU max-buffer concern as the main embed —
+                // the PLE table is pinned to CPU when the inference
+                // device is WGPU. Lookup on CPU; move result back.
+                let proj_dev = proj.device();
+                let table = if proj_dev.is_wgpu()
+                    && !embed.embeddings().device().is_wgpu()
+                {
+                    let ids_cpu = input_ids.to_device(&Device::Cpu)?;
+                    embed.forward(&ids_cpu)?.to_device(proj_dev)?
+                } else {
+                    embed.forward(input_ids)?
+                };
                 let table = table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
                 // HF wraps embed_tokens_per_layer in
                 // Gemma4TextScaledWordEmbedding(embed_scale = sqrt(hidden_per_layer)).
@@ -787,7 +798,21 @@ impl ModelWeights {
 
         // Top-level tensors.
         let tok_q = ct.tensor(reader, "token_embd.weight", device)?;
-        let embed_tokens = Embedding::new(tok_q.dequantize(device)?, cfg.hidden_size);
+        // `token_embd.weight` for Gemma 4 E2B dequantizes to ~1.5 GB at
+        // f32 (262144 vocab × hidden × 4 B). That exceeds
+        // `max_storage_buffer_binding_size` on most WebGPU adapters
+        // (1 GB on Apple Silicon / AMD; 256 MB on some Intel iGPUs),
+        // and the device-side allocation panics with
+        // "tried to create too large a buffer". Pin the dequantized
+        // table on CPU; the embedding op is just an index_select, the
+        // looked-up rows are tiny (B*T*hidden bytes) and get moved to
+        // `device` at the start of `Model::forward_inner` before any
+        // GPU op sees them.
+        let embed_device = if device.is_wgpu() { &Device::Cpu } else { device };
+        let embed_tokens = Embedding::new(
+            tok_q.dequantize(embed_device)?,
+            cfg.hidden_size,
+        );
         let norm_q = ct.tensor(reader, "output_norm.weight", device)?;
         let norm = RmsNorm::from_qtensor(norm_q, cfg.rms_norm_eps)?;
         let lm_head_q = match ct.tensor(reader, "output.weight", device) {
@@ -1115,11 +1140,16 @@ impl ModelWeights {
                     })?,
                     cfg.rms_norm_eps,
                 )?;
+                // Same WGPU max-buffer concern as `token_embd.weight` —
+                // `per_layer_token_embd` is `[vocab × num_layers × per_layer]`
+                // which on Gemma 4 E2B is also multi-GB. Pin to CPU when
+                // the inference device is WGPU.
+                let ple_dequant_dev = if device.is_wgpu() { &Device::Cpu } else { device };
                 let embed_tokens_per_layer = ct
                     .tensor(reader, "per_layer_token_embd.weight", device)
                     .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", device))
                     .ok()
-                    .and_then(|t| t.dequantize(device).ok())
+                    .and_then(|t| t.dequantize(ple_dequant_dev).ok())
                     .map(|w| Embedding::new(w, total));
                 Ok(PerLayerEmbedding {
                     embed_tokens_per_layer,
@@ -1157,7 +1187,21 @@ impl ModelWeights {
     /// `[b, q_len, vocab_size]` logits.
     pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, q_len) = xs.dims2()?;
-        let inputs_embeds = self.embed_tokens.forward(xs)?;
+        // The big `token_embd.weight` table is pinned to CPU when the
+        // model device is WGPU (see ModelWeights::from_gguf — it would
+        // otherwise overflow max_storage_buffer_binding_size). Run the
+        // embed lookup on CPU in that case and move the small result
+        // back to device.
+        let inputs_embeds = if self.device.is_wgpu()
+            && !self.embed_tokens.embeddings().device().is_wgpu()
+        {
+            let xs_cpu = xs.to_device(&Device::Cpu)?;
+            self.embed_tokens
+                .forward(&xs_cpu)?
+                .to_device(&self.device)?
+        } else {
+            self.embed_tokens.forward(xs)?
+        };
         // Gemma scale: input embeddings are multiplied by sqrt(hidden_size).
         let mut hidden = (inputs_embeds.clone() * self.embed_scale)?;
 
