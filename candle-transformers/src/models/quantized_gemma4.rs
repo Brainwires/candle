@@ -1,20 +1,23 @@
 //! Gemma 4 quantized decoder — the QMatMul/GGUF counterpart to
 //! [`gemma4::text::TextModel`].
 //!
-//! **Scope of this initial port** — basic decoder only:
+//! **Scope of this port:**
 //! - RMSNorm input + post-attention + pre-feedforward + post-feedforward
 //! - GQA self-attention with q_norm / k_norm / v_norm
 //! - p-RoPE (partial 25%) on full layers, standard RoPE on sliding
 //! - SwiGLU MLP (gate + up + down)
 //! - KV-cache (Normal for full layers, Rotating for sliding)
+//! - **KV-share donor / receiver attention** (canonical Gemma 4 layout —
+//!   layers 15..34 share K/V from donors 0..14 of the matching
+//!   sliding/full type). Donors stash post-cache `(k, v)` in a shared
+//!   store; receivers skip their own k_proj/v_proj/k_norm/RoPE and
+//!   read from the donor entry instead.
 //!
 //! **Not yet ported** (gated off via `Gemma4TextConfig::disable_altup`,
-//! `disable_laurel`, `disable_per_layer_input_gate` and
-//! `num_kv_shared_layers = 0`):
+//! `disable_laurel`, `disable_per_layer_input_gate`):
 //! - Per-Layer Embeddings (PLE)
 //! - AltUp (Alternating Updates)
 //! - LAuReL (Learned Augmented Residual Layer)
-//! - KV-share donor / receiver attention
 //! - layer_scalar
 //! - activation sparsity (Gaussian-topk)
 //!
@@ -37,6 +40,13 @@ enum KvCache {
     Normal(candle_nn::kv_cache::KvCache),
     Rotating(candle_nn::kv_cache::RotatingKvCache),
 }
+
+/// Per-step shared K/V store. Donor layers write `(k, v)` here after
+/// their own cache append; receiver layers read by donor index. Cleared
+/// at the start of every `ModelWeights::forward` so a single forward
+/// pass owns the store. Tensors are reference-counted under the hood,
+/// so the clones are cheap.
+type SharedKvStore = Vec<Option<(Tensor, Tensor)>>;
 
 use crate::models::gemma4::config::Gemma4TextConfig;
 use crate::quantized_nn::RmsNorm;
@@ -158,11 +168,14 @@ impl Module for MLP {
 #[derive(Debug, Clone)]
 struct Attention {
     q_proj: QMatMul,
-    k_proj: QMatMul,
-    v_proj: QMatMul,
+    /// `None` for receiver layers — they read K from the donor.
+    k_proj: Option<QMatMul>,
+    /// `None` for receiver layers — they read V from the donor.
+    v_proj: Option<QMatMul>,
     o_proj: QMatMul,
     q_norm: RmsNorm,
-    k_norm: RmsNorm,
+    /// `None` for receiver layers — RoPE was already applied at the donor.
+    k_norm: Option<RmsNorm>,
     num_heads: usize,
     num_kv_heads: usize,
     num_kv_groups: usize,
@@ -172,6 +185,12 @@ struct Attention {
     rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
     rotary_emb_local: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
+    /// `Some(donor_idx)` makes this a receiver — reads `(k, v)` from
+    /// `shared_kv_store[donor_idx]`. `None` makes it a donor — runs
+    /// its own k_proj/v_proj/RoPE/cache append, then writes to
+    /// `shared_kv_store[layer_idx]`.
+    donor_layer_idx: Option<usize>,
+    layer_idx: usize,
 }
 
 impl Attention {
@@ -181,41 +200,85 @@ impl Attention {
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
+        // Q is always projected from the layer's own input — receivers
+        // share K/V with their donor but keep their own Q.
         let q = self.q_proj.forward(xs)?;
-        let k = self.k_proj.forward(xs)?;
-        let v = self.v_proj.forward(xs)?;
-
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        let k = k
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-
         let q = self.q_norm.forward(&q)?;
-        let k = self.k_norm.forward(&k)?;
-        let v = v_norm(&v, self.rms_norm_eps)?;
 
-        let (q, k) = if self.is_sliding {
-            self.rotary_emb_local.apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+        // Q's RoPE comes from THIS layer's RoPE table either way. For
+        // donors we'll co-rotate q+k; for receivers we rotate only q
+        // and read k_full pre-rotated from the donor.
+        let (q, k_full, v_full) = if let Some(donor_idx) = self.donor_layer_idx {
+            // Receiver branch: rotate q only. apply_rotary_emb_qkv
+            // requires both inputs to share shape, so feed q in twice
+            // and discard the second result.
+            let q_clone = q.clone();
+            let (q_rot, _) = if self.is_sliding {
+                self.rotary_emb_local
+                    .apply_rotary_emb_qkv(&q, &q_clone, seqlen_offset)?
+            } else {
+                self.rotary_emb_global
+                    .apply_rotary_emb_qkv(&q, &q_clone, seqlen_offset)?
+            };
+            let donor = shared_kv_store
+                .get(donor_idx)
+                .and_then(|x| x.as_ref())
+                .ok_or_else(|| candle::Error::Msg(format!(
+                    "quantized_gemma4: KV-shared layer {} has no donor entry at index {} \
+                     (donor must execute earlier in the same forward pass)",
+                    self.layer_idx, donor_idx,
+                )))?;
+            (q_rot, donor.0.clone(), donor.1.clone())
         } else {
-            self.rotary_emb_global.apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            // Donor branch: project + RoPE-rotate q and k jointly,
+            // append k/v to the cache, stash post-append for any
+            // receiver later in this forward pass.
+            let k_proj = self.k_proj.as_ref().ok_or_else(|| candle::Error::Msg(
+                "quantized_gemma4: donor layer is missing its k_proj".into(),
+            ))?;
+            let v_proj = self.v_proj.as_ref().ok_or_else(|| candle::Error::Msg(
+                "quantized_gemma4: donor layer is missing its v_proj".into(),
+            ))?;
+            let k_norm = self.k_norm.as_ref().ok_or_else(|| candle::Error::Msg(
+                "quantized_gemma4: donor layer is missing its k_norm".into(),
+            ))?;
+            let k = k_proj.forward(xs)?;
+            let v = v_proj.forward(xs)?;
+            let k = k
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let v = v
+                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
+                .transpose(1, 2)?;
+            let k = k_norm.forward(&k)?;
+            let v = v_norm(&v, self.rms_norm_eps)?;
+            // q and k must share the rotated dimension; co-rotate.
+            let (q_rot, k_rot) = if self.is_sliding {
+                self.rotary_emb_local
+                    .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            } else {
+                self.rotary_emb_global
+                    .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
+            };
+            let v = v.contiguous()?;
+            let k = k_rot.contiguous()?;
+            let (k_full, v_full) = match &mut self.kv_cache {
+                KvCache::Normal(c) => c.append(&k, &v)?,
+                KvCache::Rotating(c) => c.append(&k, &v)?,
+            };
+            shared_kv_store[self.layer_idx] = Some((k_full.clone(), v_full.clone()));
+            (q_rot, k_full, v_full)
         };
 
-        let v = v.contiguous()?;
-        let (k, v) = match &mut self.kv_cache {
-            KvCache::Normal(c) => c.append(&k.contiguous()?, &v)?,
-            KvCache::Rotating(c) => c.append(&k.contiguous()?, &v)?,
-        };
-
-        let k = crate::utils::repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = crate::utils::repeat_kv(v, self.num_kv_groups)?.contiguous()?;
+        let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
+        let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
 
         // Gemma 4 sets pre-softmax scale to 1.0 — q_norm/k_norm produce
         // unit-magnitude queries/keys so the dot-products are already
@@ -263,12 +326,17 @@ impl DecoderLayer {
         attention_mask: Option<&Tensor>,
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
+        shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
         let residual = xs;
         let xs = self.input_layernorm.forward(xs)?;
-        let xs = self
-            .self_attn
-            .forward(&xs, attention_mask, sliding_attention_mask, seqlen_offset)?;
+        let xs = self.self_attn.forward(
+            &xs,
+            attention_mask,
+            sliding_attention_mask,
+            seqlen_offset,
+            shared_kv_store,
+        )?;
         let xs = self.post_attention_layernorm.forward(&xs)?;
         let xs = (xs + residual)?;
 
@@ -345,19 +413,43 @@ impl ModelWeights {
             };
             let num_kv_groups = cfg.num_attention_heads / num_kv_heads;
 
+            let donor_layer_idx = cfg.donor_layer_idx_for(layer_idx);
+            let is_receiver = donor_layer_idx.is_some();
+
             let q_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_q.weight"), device)?)?;
-            let k_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?)?;
-            let v_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?)?;
             let o_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.attn_output.weight"), device)?)?;
+
+            // Receivers don't carry their own K/V projections in the
+            // canonical Gemma 4 GGUF — they reuse the donor's. If the
+            // tensor is present it's harmless dead weight; we just
+            // skip the load.
+            let k_proj = if is_receiver {
+                None
+            } else {
+                Some(QMatMul::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_k.weight"), device)?,
+                )?)
+            };
+            let v_proj = if is_receiver {
+                None
+            } else {
+                Some(QMatMul::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_v.weight"), device)?,
+                )?)
+            };
 
             let q_norm = RmsNorm::from_qtensor(
                 ct.tensor(reader, &format!("{prefix}.attn_q_norm.weight"), device)?,
                 cfg.rms_norm_eps,
             )?;
-            let k_norm = RmsNorm::from_qtensor(
-                ct.tensor(reader, &format!("{prefix}.attn_k_norm.weight"), device)?,
-                cfg.rms_norm_eps,
-            )?;
+            let k_norm = if is_receiver {
+                None
+            } else {
+                Some(RmsNorm::from_qtensor(
+                    ct.tensor(reader, &format!("{prefix}.attn_k_norm.weight"), device)?,
+                    cfg.rms_norm_eps,
+                )?)
+            };
 
             let kv_cache = if is_sliding {
                 KvCache::Rotating(candle_nn::kv_cache::RotatingKvCache::new(2, cfg.effective_sliding_window()))
@@ -381,6 +473,8 @@ impl ModelWeights {
                 rotary_emb_global: rotary_global.clone(),
                 rotary_emb_local: rotary_local.clone(),
                 kv_cache,
+                donor_layer_idx,
+                layer_idx,
             };
 
             let gate_proj = QMatMul::from_qtensor(ct.tensor(reader, &format!("{prefix}.ffn_gate.weight"), device)?)?;
@@ -453,12 +547,20 @@ impl ModelWeights {
             )?)
         };
 
+        // Per-step shared K/V store for KV-shared receivers. Keyed by
+        // donor layer index — donors write here after their cache
+        // append, receivers read by donor index later in the same
+        // forward pass. Reset every step.
+        let mut shared_kv_store: SharedKvStore =
+            (0..self.cfg.num_hidden_layers).map(|_| None).collect();
+
         for layer in self.layers.iter_mut() {
             hidden = layer.forward(
                 &hidden,
                 attention_mask.as_ref(),
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
+                &mut shared_kv_store,
             )?;
         }
         let hidden = self.norm.forward(&hidden)?;
