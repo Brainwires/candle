@@ -72,6 +72,7 @@ pub mod mobileone;
 pub mod modernbert;
 pub mod moondream;
 pub mod mpt;
+pub mod nomic_bert;
 pub mod nvembed_v2;
 pub mod olmo;
 pub mod olmo2;
