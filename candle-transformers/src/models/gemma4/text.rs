@@ -168,9 +168,13 @@ impl ProportionalRotaryEmbedding {
 #[derive(Debug, Clone)]
 #[allow(clippy::upper_case_acronyms)]
 struct MLP {
-    gate_proj: Linear,
-    up_proj: Linear,
+    /// Fused gate||up projection. Constructed by concatenating the
+    /// per-tensor gate_proj and up_proj weights along the output (row)
+    /// axis. One matmul/dispatch instead of two per FFN; the result is
+    /// split halfway along the last dim into (gate, up).
+    gate_up_proj: Linear,
     down_proj: Linear,
+    intermediate_size: usize,
     act_fn: Activation,
     /// Pre-activation Gaussian-topk threshold offset
     /// `icdf_normal(sparsity)`. `0.0` disables sparsity for this layer.
@@ -188,8 +192,24 @@ impl MLP {
         sparsity: f64,
         vb: VarBuilder,
     ) -> Result<Self> {
-        let gate_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("gate_proj"))?;
-        let up_proj = linear_bias(hidden_size, intermediate_size, bias, vb.pp("up_proj"))?;
+        // Load gate_proj + up_proj separately and concat along output
+        // axis (dim=0 of the weight). Saves one matmul dispatch per
+        // layer × num_layers per token. Pattern from candle PR #3485.
+        let gate_w = vb
+            .pp("gate_proj")
+            .get((intermediate_size, hidden_size), "weight")?;
+        let up_w = vb
+            .pp("up_proj")
+            .get((intermediate_size, hidden_size), "weight")?;
+        let fused_w = Tensor::cat(&[&gate_w, &up_w], 0)?.contiguous()?;
+        let fused_bias = if bias {
+            let gate_b = vb.pp("gate_proj").get(intermediate_size, "bias")?;
+            let up_b = vb.pp("up_proj").get(intermediate_size, "bias")?;
+            Some(Tensor::cat(&[&gate_b, &up_b], 0)?.contiguous()?)
+        } else {
+            None
+        };
+        let gate_up_proj = Linear::new(fused_w, fused_bias);
         let down_proj = linear_bias(intermediate_size, hidden_size, bias, vb.pp("down_proj"))?;
         let sparsity_threshold_z = if sparsity > 0.0 && sparsity < 1.0 {
             // icdf of standard normal at p = sparsity. Using
@@ -199,9 +219,9 @@ impl MLP {
             0.0
         };
         Ok(Self {
-            gate_proj,
-            up_proj,
+            gate_up_proj,
             down_proj,
+            intermediate_size,
             act_fn: act,
             sparsity_threshold_z,
         })
@@ -211,7 +231,9 @@ impl MLP {
     /// activation. Equivalent to HF `Gemma3nTextMLP.gaussian_topk` + the
     /// surrounding gate/up/down flow.
     fn forward_inner(&self, xs: &Tensor) -> Result<Tensor> {
-        let mut gate = xs.apply(&self.gate_proj)?;
+        let gate_up = xs.apply(&self.gate_up_proj)?;
+        let mut gate = gate_up.narrow(D::Minus1, 0, self.intermediate_size)?;
+        let rhs = gate_up.narrow(D::Minus1, self.intermediate_size, self.intermediate_size)?;
         if self.sparsity_threshold_z != 0.0 {
             // threshold = mean + std * z, applied per-token along the
             // intermediate axis. mean / std computed in f32 for stability.
@@ -231,7 +253,6 @@ impl MLP {
             gate = sparse.to_dtype(original_dtype)?;
         }
         let lhs = gate.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
         (lhs * rhs)?.apply(&self.down_proj)
     }
 }
