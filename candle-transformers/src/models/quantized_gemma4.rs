@@ -18,11 +18,16 @@
 //!   Required on Gemma 4 E2B; without it `abs_max` runs away.
 //! - **activation sparsity** (Gaussian-topk) — pre-activation gate
 //!   thresholding using `mean+std*z` with `z = sqrt(2)*erfinv(2p-1)`.
+//! - **PLE side-channel** — per-layer-embed table (or projection alone
+//!   on memory-constrained hosts) → `gate(h) → act → * per_layer_input
+//!   → projection → norm → +residual`. Wired through every
+//!   `DecoderLayer`; falls back to a no-op when the GGUF doesn't
+//!   carry `per_layer_model_proj.weight`.
 //!
-//! **Not yet ported** (gated off via `Gemma4TextConfig::disable_altup`,
-//! `disable_per_layer_input_gate`):
-//! - Per-Layer Embeddings (PLE)
-//! - AltUp (Alternating Updates)
+//! **Not yet ported** (gated off via `Gemma4TextConfig::disable_altup`):
+//! - AltUp (Alternating Updates) — needs multi-stream forward
+//!   restructuring (predict/activate/correct over `altup_num_inputs`
+//!   parallel hidden streams).
 //!
 //! Output won't match Gemma 4 reference exactly with the auxiliary
 //! towers off — this scaffold exists to exercise the QMatMul + GGUF
@@ -365,6 +370,59 @@ impl Attention {
     }
 }
 
+// ── PerLayerEmbedding (PLE side-channel) ────────────────────────────────────
+//
+// Computed once per step from input_ids + inputs_embeds, returns a
+// `[B, T, num_layers, hidden_per_layer]` table. DecoderLayer slices
+// `[B, T, hidden_per_layer]` out of it via `per_layer_input.i((.., .., layer_idx, ..))`
+// and uses it as the side-channel `gate(h) * per_layer_input` →
+// projection → norm → +residual block at the end of each layer.
+
+#[derive(Debug, Clone)]
+struct PerLayerEmbedding {
+    /// `[vocab_per_layer, num_layers * hidden_per_layer]`, lookup
+    /// is the standard Embedding op. Optional — large publications
+    /// may skip this layer to save memory; without it the side-channel
+    /// is the projection alone (loses per-token PLE signal).
+    embed_tokens_per_layer: Option<Embedding>,
+    /// `[hidden_size, num_layers * hidden_per_layer]` projection of
+    /// the main `inputs_embeds` into the same flat space.
+    per_layer_model_projection: QMatMul,
+    /// RmsNorm over the inner `hidden_per_layer` axis (weight shape
+    /// `[hidden_per_layer]`, NOT `[num_layers * hidden_per_layer]`).
+    per_layer_projection_norm: RmsNorm,
+    /// `1/√hidden_size`, applied to the projection so the merged
+    /// signal stays at unit-ish variance.
+    per_layer_projection_scale: f64,
+    num_hidden_layers: usize,
+    hidden_per_layer: usize,
+    /// `1/√2`, applied to the merged projection+table sum so the two
+    /// sources don't double-up.
+    per_layer_input_scale: f64,
+}
+
+impl PerLayerEmbedding {
+    fn forward(&self, input_ids: &Tensor, inputs_embeds: &Tensor) -> Result<Tensor> {
+        let (b, t) = input_ids.dims2()?;
+        let proj = self.per_layer_model_projection.forward(inputs_embeds)?;
+        let proj = (proj * self.per_layer_projection_scale)?;
+        let proj = proj.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+        let proj = self.per_layer_projection_norm.forward(&proj)?;
+        let merged = match &self.embed_tokens_per_layer {
+            Some(embed) => {
+                let table = embed.forward(input_ids)?;
+                let table = table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
+                // HF wraps embed_tokens_per_layer in
+                // Gemma4TextScaledWordEmbedding(embed_scale = sqrt(hidden_per_layer)).
+                let table = (table * (self.hidden_per_layer as f64).sqrt())?;
+                (proj.broadcast_add(&table)? * self.per_layer_input_scale)?
+            }
+            None => (proj * self.per_layer_input_scale)?,
+        };
+        merged.contiguous()
+    }
+}
+
 // ── DecoderLayer ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -386,6 +444,15 @@ struct DecoderLayer {
     /// per-layer trained gain (`abs_max` will run away on Gemma 4
     /// E2B). Read from `blk.{i}.layer_scalar`.
     layer_scalar: Option<Tensor>,
+    /// PLE side-channel: gate(h) → act → * per_layer_input → projection
+    /// → norm → +residual. Only constructed when the model has PLE
+    /// enabled. All three tensors must be present for the block to
+    /// run; `None` on any one falls back to no side-channel.
+    per_layer_input_gate: Option<QMatMul>,
+    per_layer_projection: Option<QMatMul>,
+    post_per_layer_input_norm: Option<RmsNorm>,
+    /// Activation for the PLE gate (matches `cfg.hidden_activation`).
+    per_layer_act: Activation,
 }
 
 impl DecoderLayer {
@@ -396,6 +463,7 @@ impl DecoderLayer {
         sliding_attention_mask: Option<&Tensor>,
         seqlen_offset: usize,
         shared_kv_store: &mut SharedKvStore,
+        per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
         let residual = xs;
         let normed_input = self.input_layernorm.forward(xs)?;
@@ -423,6 +491,25 @@ impl DecoderLayer {
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
         let xs = (residual + mlp_out)?;
 
+        // PLE side-channel — gate(h) → act → * per_layer_input → proj
+        // → norm → +residual. All four components must be present.
+        let xs = if let (Some(gate), Some(proj), Some(norm), Some(per_layer_input)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let r = xs.clone();
+            let g = gate.forward(&xs)?;
+            let g = g.apply(&self.per_layer_act)?;
+            let g = g.broadcast_mul(per_layer_input)?;
+            let g = proj.forward(&g)?;
+            let g = norm.forward(&g)?;
+            (g + r)?
+        } else {
+            xs
+        };
+
         // Per-layer learned gain (Gemma 4 specifically — initialised to
         // 1.0 and trained per layer). Without this multiply the
         // residual stream `abs_max` runs away on E2B.
@@ -443,6 +530,15 @@ pub struct ModelWeights {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: QMatMul,
+    /// PLE side-channel computer. `None` when the GGUF doesn't carry
+    /// the PLE projection tensors (most current Ollama publications);
+    /// without it DecoderLayer's PLE block is a no-op even if
+    /// per_layer_input_gate / per_layer_projection / post_per_layer_input_norm
+    /// are present at the layer.
+    per_layer_embedding: Option<PerLayerEmbedding>,
+    /// `√hidden_size` — Gemma input embeddings are scaled by this
+    /// before entering the decoder stack.
+    embed_scale: f64,
     device: Device,
     dtype: DType,
     cfg: Gemma4TextConfig,
@@ -628,6 +724,43 @@ impl ModelWeights {
                 .ok()
                 .and_then(|t| t.dequantize(device).ok());
 
+            // PLE side-channel — three optional QMatMul projections
+            // and a norm. Only constructed when the model has PLE
+            // enabled in config and all three tensors are present.
+            // Falls back to no side-channel on any missing tensor.
+            let ple_gate_enabled =
+                cfg.hidden_size_per_layer_input.is_some() && !cfg.disable_per_layer_input_gate;
+            let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
+                if ple_gate_enabled {
+                    let mut try_ple = || -> Result<(QMatMul, QMatMul, RmsNorm)> {
+                        let gate = QMatMul::from_qtensor(ct.tensor(
+                            reader,
+                            &format!("{prefix}.per_layer_inp_gate.weight"),
+                            device,
+                        )?)?;
+                        let proj = QMatMul::from_qtensor(ct.tensor(
+                            reader,
+                            &format!("{prefix}.per_layer_proj.weight"),
+                            device,
+                        )?)?;
+                        let norm = RmsNorm::from_qtensor(
+                            ct.tensor(
+                                reader,
+                                &format!("{prefix}.post_per_layer_input_norm.weight"),
+                                device,
+                            )?,
+                            cfg.rms_norm_eps,
+                        )?;
+                        Ok((gate, proj, norm))
+                    };
+                    match try_ple() {
+                        Ok((g, p, n)) => (Some(g), Some(p), Some(n)),
+                        Err(_) => (None, None, None),
+                    }
+                } else {
+                    (None, None, None)
+                };
+
             layers.push(DecoderLayer {
                 self_attn,
                 mlp,
@@ -638,14 +771,59 @@ impl ModelWeights {
                 laurel,
                 inv_sqrt_2: (2.0_f64).powf(-0.5),
                 layer_scalar,
+                per_layer_input_gate,
+                per_layer_projection,
+                post_per_layer_input_norm,
+                per_layer_act: cfg.hidden_activation,
             });
         }
+
+        // Build the PLE side-channel computer if config enables it.
+        // Loads `per_layer_model_proj.weight` (the [hidden, num_layers *
+        // hidden_per_layer] projection), `per_layer_projection_norm.weight`,
+        // and optionally `embed_tokens_per_layer.weight` (the big VxLxH
+        // table; on memory-constrained targets like wasm32 chat-pwa
+        // this is skipped and the side-channel falls back to projection-only).
+        let per_layer_embedding = if let (Some(hidden_per_layer), false) = (
+            cfg.hidden_size_per_layer_input,
+            cfg.disable_per_layer_input_gate,
+        ) {
+            let mut try_ple = || -> Result<PerLayerEmbedding> {
+                let total = cfg.num_hidden_layers * hidden_per_layer;
+                let per_layer_model_projection = QMatMul::from_qtensor(
+                    ct.tensor(reader, "per_layer_model_proj.weight", device)?,
+                )?;
+                let per_layer_projection_norm = RmsNorm::from_qtensor(
+                    ct.tensor(reader, "per_layer_projection_norm.weight", device)?,
+                    cfg.rms_norm_eps,
+                )?;
+                let embed_tokens_per_layer = ct
+                    .tensor(reader, "embed_tokens_per_layer.weight", device)
+                    .ok()
+                    .and_then(|t| t.dequantize(device).ok())
+                    .map(|w| Embedding::new(w, total));
+                Ok(PerLayerEmbedding {
+                    embed_tokens_per_layer,
+                    per_layer_model_projection,
+                    per_layer_projection_norm,
+                    per_layer_projection_scale: (cfg.hidden_size as f64).powf(-0.5),
+                    num_hidden_layers: cfg.num_hidden_layers,
+                    hidden_per_layer,
+                    per_layer_input_scale: (2.0_f64).powf(-0.5),
+                })
+            };
+            try_ple().ok()
+        } else {
+            None
+        };
 
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            per_layer_embedding,
+            embed_scale: (cfg.hidden_size as f64).sqrt(),
             device: device.clone(),
             dtype,
             cfg: cfg.clone(),
@@ -656,10 +834,9 @@ impl ModelWeights {
     /// `[b, q_len, vocab_size]` logits.
     pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, q_len) = xs.dims2()?;
-        let mut hidden = self.embed_tokens.forward(xs)?;
+        let inputs_embeds = self.embed_tokens.forward(xs)?;
         // Gemma scale: input embeddings are multiplied by sqrt(hidden_size).
-        let scale = (self.cfg.hidden_size as f64).sqrt();
-        hidden = (hidden * scale)?;
+        let mut hidden = (inputs_embeds.clone() * self.embed_scale)?;
 
         let attention_mask = if q_len <= 1 {
             None
@@ -679,6 +856,14 @@ impl ModelWeights {
             )?)
         };
 
+        // PLE side-channel — compute the full `[B, T, num_layers,
+        // hidden_per_layer]` table once per step and slice per layer
+        // inside the loop.
+        let per_layer_table = match &self.per_layer_embedding {
+            Some(ple) => Some(ple.forward(xs, &inputs_embeds)?),
+            None => None,
+        };
+
         // Per-step shared K/V store for KV-shared receivers. Keyed by
         // donor layer index — donors write here after their cache
         // append, receivers read by donor index later in the same
@@ -686,13 +871,18 @@ impl ModelWeights {
         let mut shared_kv_store: SharedKvStore =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
-        for layer in self.layers.iter_mut() {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let per_layer_input = match &per_layer_table {
+                Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
+                None => None,
+            };
             hidden = layer.forward(
                 &hidden,
                 attention_mask.as_ref(),
                 sliding_attention_mask.as_ref(),
                 seqlen_offset,
                 &mut shared_kv_store,
+                per_layer_input.as_ref(),
             )?;
         }
         let hidden = self.norm.forward(&hidden)?;
