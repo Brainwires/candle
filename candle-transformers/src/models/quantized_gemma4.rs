@@ -748,9 +748,12 @@ impl ModelWeights {
     ) -> Result<Self> {
         let dtype = DType::F32; // RoPE tables computed in f32, broadcast to weight dtype later
 
+        // Full-attention layers use `global_head_dim` (Gemma 4 E2B: 512)
+        // with p-RoPE 25%; sliding layers use `head_dim` (256) with
+        // standard full-rotation RoPE on the SWA base frequency.
         let rotary_global = Arc::new(ProportionalRotaryEmbedding::new(
             dtype,
-            cfg.head_dim,
+            cfg.global_head_dim,
             cfg.rope_theta,
             cfg.partial_rotary_factor(),
             cfg.max_position_embeddings,
@@ -908,12 +911,15 @@ impl ModelWeights {
                 None
             };
 
-            // Per-layer scalar — single f32 [1] tensor at `blk.{i}.layer_scalar`.
-            // Optional: publications without this tensor silently skip
-            // the multiply (Gemma 4 E2B's residual stream needs it,
-            // older Gemma generations don't have it).
+            // Per-layer scalar — single f32 [1] tensor. Ollama's
+            // gemma4:e2b publishes it as `layer_output_scale.weight`;
+            // older llama.cpp Gemma 3n style was `layer_scalar`. Fall
+            // back through both before giving up. Optional: publications
+            // without this tensor silently skip the multiply (Gemma 4
+            // E2B's residual stream needs it, older Gemmas don't).
             let layer_scalar = ct
-                .tensor(reader, &format!("{prefix}.layer_scalar"), device)
+                .tensor(reader, &format!("{prefix}.layer_output_scale.weight"), device)
+                .or_else(|_| ct.tensor(reader, &format!("{prefix}.layer_scalar"), device))
                 .ok()
                 .and_then(|t| t.dequantize(device).ok());
 
@@ -925,22 +931,30 @@ impl ModelWeights {
                 cfg.hidden_size_per_layer_input.is_some() && !cfg.disable_per_layer_input_gate;
             let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
                 if ple_gate_enabled {
+                    // Ollama's gemma4:e2b uses bare names
+                    // (`inp_gate.weight`, `proj.weight`,
+                    // `post_norm.weight`); older llama.cpp gemma3n
+                    // publications used `per_layer_inp_gate.weight` /
+                    // `per_layer_proj.weight` /
+                    // `post_per_layer_input_norm.weight`. Try both.
+                    let mut try_load = |new_name: &str, legacy_name: &str| -> Result<QTensor> {
+                        ct.tensor(reader, &format!("{prefix}.{new_name}"), device).or_else(
+                            |_| ct.tensor(reader, &format!("{prefix}.{legacy_name}"), device),
+                        )
+                    };
                     let mut try_ple = || -> Result<(QMatMul, QMatMul, RmsNorm)> {
-                        let gate = QMatMul::from_qtensor(ct.tensor(
-                            reader,
-                            &format!("{prefix}.per_layer_inp_gate.weight"),
-                            device,
+                        let gate = QMatMul::from_qtensor(try_load(
+                            "inp_gate.weight",
+                            "per_layer_inp_gate.weight",
                         )?)?;
-                        let proj = QMatMul::from_qtensor(ct.tensor(
-                            reader,
-                            &format!("{prefix}.per_layer_proj.weight"),
-                            device,
+                        let proj = QMatMul::from_qtensor(try_load(
+                            "proj.weight",
+                            "per_layer_proj.weight",
                         )?)?;
                         let norm = RmsNorm::from_qtensor(
-                            ct.tensor(
-                                reader,
-                                &format!("{prefix}.post_per_layer_input_norm.weight"),
-                                device,
+                            try_load(
+                                "post_norm.weight",
+                                "post_per_layer_input_norm.weight",
                             )?,
                             cfg.rms_norm_eps,
                         )?;
@@ -1062,15 +1076,25 @@ impl ModelWeights {
         ) {
             let mut try_ple = || -> Result<PerLayerEmbedding> {
                 let total = cfg.num_hidden_layers * hidden_per_layer;
+                // Ollama's gemma4:e2b: `per_layer_model_proj.weight`,
+                // `per_layer_proj_norm.weight`, `per_layer_token_embd.weight`.
+                // Older llama.cpp gemma3n: `_projection`, `_norm`,
+                // `embed_tokens_per_layer`. Accept both.
                 let per_layer_model_projection = QMatMul::from_qtensor(
-                    ct.tensor(reader, "per_layer_model_proj.weight", device)?,
+                    ct.tensor(reader, "per_layer_model_proj.weight", device)
+                        .or_else(|_| {
+                            ct.tensor(reader, "per_layer_model_projection.weight", device)
+                        })?,
                 )?;
                 let per_layer_projection_norm = RmsNorm::from_qtensor(
-                    ct.tensor(reader, "per_layer_projection_norm.weight", device)?,
+                    ct.tensor(reader, "per_layer_proj_norm.weight", device).or_else(|_| {
+                        ct.tensor(reader, "per_layer_projection_norm.weight", device)
+                    })?,
                     cfg.rms_norm_eps,
                 )?;
                 let embed_tokens_per_layer = ct
-                    .tensor(reader, "embed_tokens_per_layer.weight", device)
+                    .tensor(reader, "per_layer_token_embd.weight", device)
+                    .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", device))
                     .ok()
                     .and_then(|t| t.dequantize(device).ok())
                     .map(|w| Embedding::new(w, total));
@@ -1217,7 +1241,16 @@ impl ModelWeights {
         // Take the last token only for autoregressive sampling — same as
         // gemma4/text.rs.
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
-        self.lm_head.forward(&hidden)
+        let logits = self.lm_head.forward(&hidden)?;
+        // Final-logit softcap: tanh(logits / softcap) * softcap.
+        match self.cfg.final_logit_softcapping {
+            Some(sc) if sc > 0.0 => {
+                let scaled = (logits / sc)?;
+                let capped = scaled.tanh()?;
+                capped * sc
+            }
+            _ => Ok(logits),
+        }
     }
 
     pub fn clear_kv_cache(&mut self) {
