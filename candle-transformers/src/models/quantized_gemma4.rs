@@ -797,20 +797,25 @@ impl ModelWeights {
         )?);
 
         // Top-level tensors.
-        let tok_q = ct.tensor(reader, "token_embd.weight", device)?;
         // `token_embd.weight` for Gemma 4 E2B dequantizes to ~1.5 GB at
         // f32 (262144 vocab × hidden × 4 B). That exceeds
         // `max_storage_buffer_binding_size` on most WebGPU adapters
         // (1 GB on Apple Silicon / AMD; 256 MB on some Intel iGPUs),
         // and the device-side allocation panics with
-        // "tried to create too large a buffer". Pin the dequantized
-        // table on CPU; the embedding op is just an index_select, the
-        // looked-up rows are tiny (B*T*hidden bytes) and get moved to
-        // `device` at the start of `Model::forward_inner` before any
-        // GPU op sees them.
-        let embed_device = if device.is_wgpu() { &Device::Cpu } else { device };
+        // "tried to create too large a buffer".
+        //
+        // `QTensor::dequantize(target_dev)` allocates the dequantized
+        // output on the QTensor's *storage* device first, then moves
+        // — so passing CPU as `target_dev` after loading the QTensor
+        // onto WGPU still busts the buffer-size cap on the way through.
+        // Load the QTensor itself onto CPU instead, dequantize CPU→CPU,
+        // and keep the embedding pinned there. The lookup result is
+        // small (B*T*hidden bytes) and gets moved to `device` at the
+        // start of `Model::forward_inner`.
+        let embed_storage_dev = if device.is_wgpu() { &Device::Cpu } else { device };
+        let tok_q = ct.tensor(reader, "token_embd.weight", embed_storage_dev)?;
         let embed_tokens = Embedding::new(
-            tok_q.dequantize(embed_device)?,
+            tok_q.dequantize(embed_storage_dev)?,
             cfg.hidden_size,
         );
         let norm_q = ct.tensor(reader, "output_norm.weight", device)?;
@@ -1142,14 +1147,15 @@ impl ModelWeights {
                 )?;
                 // Same WGPU max-buffer concern as `token_embd.weight` —
                 // `per_layer_token_embd` is `[vocab × num_layers × per_layer]`
-                // which on Gemma 4 E2B is also multi-GB. Pin to CPU when
-                // the inference device is WGPU.
-                let ple_dequant_dev = if device.is_wgpu() { &Device::Cpu } else { device };
+                // which on Gemma 4 E2B is also multi-GB. Load the QTensor
+                // onto CPU directly when the inference device is WGPU so
+                // dequantize allocates on CPU, not on the over-cap WGPU.
+                let ple_storage_dev = if device.is_wgpu() { &Device::Cpu } else { device };
                 let embed_tokens_per_layer = ct
-                    .tensor(reader, "per_layer_token_embd.weight", device)
-                    .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", device))
+                    .tensor(reader, "per_layer_token_embd.weight", ple_storage_dev)
+                    .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", ple_storage_dev))
                     .ok()
-                    .and_then(|t| t.dequantize(ple_dequant_dev).ok())
+                    .and_then(|t| t.dequantize(ple_storage_dev).ok())
                     .map(|w| Embedding::new(w, total));
                 Ok(PerLayerEmbedding {
                     embed_tokens_per_layer,
