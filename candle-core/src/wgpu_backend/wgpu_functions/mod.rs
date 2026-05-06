@@ -3,6 +3,7 @@ pub mod cmp;
 pub mod conv2d;
 pub mod convert;
 pub mod copy;
+pub mod flash_attn;
 pub mod gather;
 pub mod index_select;
 pub mod matmul;
@@ -41,6 +42,7 @@ pub use copy::{
     queue_copy, queue_copy2d, queue_copy3d, queue_copy3d_padded, queue_copy_strided,
     queue_transpose3d,
 };
+pub use flash_attn::queue_flash_attn_decode;
 pub use gather::{
     queue_gather, queue_index_add_inplace, queue_scatter_add_inplace, queue_scatter_set_inplace,
 };

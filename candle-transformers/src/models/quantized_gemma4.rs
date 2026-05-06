@@ -255,6 +255,10 @@ struct Attention {
     head_dim: usize,
     rms_norm_eps: f64,
     is_sliding: bool,
+    /// Sliding-window size for `flash_attn_decode`'s implicit mask.
+    /// `Some(w)` for sliding layers, `None` for full-attention layers.
+    /// Equals `cfg.effective_sliding_window()` when `is_sliding`.
+    sliding_window: Option<u32>,
     rotary_emb_global: Arc<ProportionalRotaryEmbedding>,
     rotary_emb_local: Arc<RotaryEmbedding>,
     kv_cache: KvCache,
@@ -361,15 +365,24 @@ impl Attention {
         // Gemma 4 sets pre-softmax scale to 1.0 — q_norm/k_norm produce
         // unit-magnitude queries/keys so the dot-products are already
         // O(1). No divide here.
-        let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-
-        let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
-        let attn_weights = match mask {
-            Some(m) => attn_weights.broadcast_add(m)?,
-            None => attn_weights,
+        //
+        // Decode (q_len == 1): use the fused flash-attention kernel so
+        // the `[B, H, 1, kv_len]` attn-weights tensor never materializes.
+        // The mask is implicit (causal + optional sliding window). For
+        // prefill (q_len > 1) we keep the standard 3-step path — the
+        // fused kernel is decode-only.
+        let attn_output = if q_len == 1 {
+            candle_nn::flash_attn::flash_attn_decode(&q, &k, &v, self.sliding_window)?
+        } else {
+            let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+            let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
+            let attn_weights = match mask {
+                Some(m) => attn_weights.broadcast_add(m)?,
+                None => attn_weights,
+            };
+            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            attn_weights.matmul(&v)?
         };
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
             .transpose(1, 2)?
@@ -853,6 +866,11 @@ impl ModelWeights {
                 head_dim,
                 rms_norm_eps: cfg.rms_norm_eps,
                 is_sliding,
+                sliding_window: if is_sliding {
+                    Some(cfg.effective_sliding_window() as u32)
+                } else {
+                    None
+                },
                 rotary_emb_global: rotary_global.clone(),
                 rotary_emb_local: rotary_local.clone(),
                 kv_cache,

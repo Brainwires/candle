@@ -1,0 +1,196 @@
+#include "util.pwgsl"
+// Fused decode-attention kernel (q_seq == 1 only). Replaces the
+// 3-dispatch decode path:
+//
+//   attn_weights = Q.matmul(K.transpose(-2,-1))
+//   attn_weights += mask                       (causal / sliding)
+//   attn_weights = softmax_last_dim(attn_weights)
+//   attn_output  = attn_weights.matmul(V)
+//
+// with a single workgroup-per-(batch,head) fused kernel that uses
+// online softmax (Welford-style m / l / O accumulators) so the
+// `attn_weights` tensor never materializes in global memory.
+//
+// One workgroup per (batch, head). Workgroup size 64. Each thread
+// handles `head_dim / 64` channels of Q / V / O — Gemma 4's head
+// dims (256 / 512) are both divisible by 64.
+//
+// Inputs (all f32, contiguous):
+//   v_input1 = Q [B, num_heads, 1, head_dim]
+//   v_input2 = K [B, num_heads, kv_len, head_dim]   (post repeat_kv)
+//   v_input3 = V [B, num_heads, kv_len, head_dim]   (post repeat_kv)
+// Output:
+//   v_dest   = O [B, num_heads, 1, head_dim]
+//
+// Mask is implicit:
+//   - causal: kv_idx > q_pos  (where q_pos = kv_len - 1 for decode)
+//   - sliding: kv_idx + sliding_window <= q_pos
+//   sliding_window = 0xFFFFFFFFu means "no sliding" (full attention).
+//
+// The kernel is f32-only for now (workgroup memory size scales with
+// head_dim, and we want predictable accumulator precision). bf16 /
+// f16 inputs/outputs can be added later by wrapping the loads /
+// stores with BF16_LOAD / BF16_STORE_ATOMIC etc.
+
+LOAD_INFO(op_flash_attn, 8)
+#define op_flash_attn_b              op_flash_attn[0]
+#define op_flash_attn_num_heads      op_flash_attn[1]
+#define op_flash_attn_num_kv_heads   op_flash_attn[2]
+#define op_flash_attn_head_dim       op_flash_attn[3]
+#define op_flash_attn_kv_len         op_flash_attn[4]
+#define op_flash_attn_sliding_window op_flash_attn[5]
+#define op_flash_attn_q_offset       op_flash_attn[6]
+#define op_flash_attn_kv_offset      op_flash_attn[7]
+
+#ifdef f32
+
+// Compile-time max head_dim. Gemma 4 global attention uses 512;
+// 1024 leaves headroom for any model up to that bound. Increases
+// workgroup-shared usage by 4 * MAX_HEAD_DIM bytes (= 4 KiB at 1024).
+const MAX_HEAD_DIM: u32 = 1024u;
+const WG_SIZE: u32     = 64u;
+const NEG_INF_F32: f32 = -3.40282e+38;
+
+// Per-thread channel cache for Q (we reuse Q across every kv_idx, so
+// loading once into registers / function-scoped vars saves bandwidth).
+// MAX_CHANNELS_PER_THREAD = MAX_HEAD_DIM / WG_SIZE = 16.
+const MAX_CHANNELS_PER_THREAD: u32 = 16u;
+
+// Workgroup-shared scratch.
+var<workgroup> sharedScores: array<f32, WG_SIZE>;  // dot-product reduction
+var<workgroup> sharedM: f32;                       // running max
+var<workgroup> sharedL: f32;                       // running sum of exp
+var<workgroup> sharedScale: f32;                   // l_scale = exp(old_m - new_m)
+var<workgroup> sharedWeight: f32;                  // exp(score - new_m)
+var<workgroup> sharedO: array<f32, MAX_HEAD_DIM>;  // running output
+
+@compute
+@workgroup_size(64, 1, 1)
+fn flash_attn_decode(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+) {
+    let tid = local_id.x;
+    let bh = wg_id.x;
+
+    let head_dim    = op_flash_attn_head_dim;
+    let kv_len      = op_flash_attn_kv_len;
+    let num_heads   = op_flash_attn_num_heads;
+    let sliding_win = op_flash_attn_sliding_window;
+    let q_offset    = op_flash_attn_q_offset;
+    let kv_offset   = op_flash_attn_kv_offset;
+
+    let head  = bh % num_heads;
+    let batch = bh / num_heads;
+
+    // For decode q_len == 1, the query position in the KV timeline is
+    // kv_len - 1 (the most recent token).
+    let q_pos = kv_len - 1u;
+
+    let channels_per_thread = head_dim / WG_SIZE;
+
+    // Q layout: (B, H, 1, D) flattened row-major. Q for this (batch, head):
+    let q_base = (batch * num_heads + head) * head_dim + q_offset;
+    // K / V layout: (B, H, kv_len, D) flattened row-major.
+    let kv_head_base = (batch * num_heads + head) * kv_len * head_dim + kv_offset;
+
+    // Initialize shared accumulators (single thread for the scalars).
+    if (tid == 0u) {
+        sharedM      = NEG_INF_F32;
+        sharedL      = 0.0;
+        sharedScale  = 0.0;
+        sharedWeight = 0.0;
+    }
+    // Each thread zeros its slice of sharedO.
+    for (var c = 0u; c < channels_per_thread; c++) {
+        sharedO[tid * channels_per_thread + c] = 0.0;
+    }
+
+    // Load Q channels owned by this thread into registers — Q is
+    // referenced once per kv_idx, so caching saves kv_len global reads.
+    var q_local: array<f32, MAX_CHANNELS_PER_THREAD>;
+    for (var c = 0u; c < channels_per_thread; c++) {
+        q_local[c] = v_input1[q_base + tid * channels_per_thread + c];
+    }
+
+    workgroupBarrier();
+
+    // Stream over kv positions one at a time. The "tile" axis here is
+    // 1 — keeping the kernel simple. Larger tiles would amortize the
+    // softmax-update and barrier overhead but require more shared mem
+    // for the per-kv score buffer; left as a future optimization.
+    for (var kv_idx = 0u; kv_idx < kv_len; kv_idx++) {
+        // ---- 1. score[i] = Q · K[i] ----
+        // Each thread sums its `channels_per_thread` partial products,
+        // then a tree-reduction across the workgroup gives the full dot.
+        var partial: f32 = 0.0;
+        let k_row_base = kv_head_base + kv_idx * head_dim + tid * channels_per_thread;
+        for (var c = 0u; c < channels_per_thread; c++) {
+            partial += q_local[c] * v_input2[k_row_base + c];
+        }
+        sharedScores[tid] = partial;
+        workgroupBarrier();
+
+        // Tree reduction: 64 → 32 → 16 → 8 → 4 → 2 → 1.
+        if (tid < 32u) { sharedScores[tid] += sharedScores[tid + 32u]; }
+        workgroupBarrier();
+        if (tid < 16u) { sharedScores[tid] += sharedScores[tid + 16u]; }
+        workgroupBarrier();
+        if (tid < 8u)  { sharedScores[tid] += sharedScores[tid + 8u];  }
+        workgroupBarrier();
+        if (tid < 4u)  { sharedScores[tid] += sharedScores[tid + 4u];  }
+        workgroupBarrier();
+        if (tid < 2u)  { sharedScores[tid] += sharedScores[tid + 2u];  }
+        workgroupBarrier();
+        if (tid == 0u) { sharedScores[0]   += sharedScores[1];         }
+        workgroupBarrier();
+
+        var score = sharedScores[0];
+
+        // ---- 2. Apply causal / sliding mask ----
+        let causal_masked  = kv_idx > q_pos;
+        let sliding_masked = (sliding_win != 0xFFFFFFFFu) &&
+                             ((kv_idx + sliding_win) <= q_pos);
+        if (causal_masked || sliding_masked) {
+            score = NEG_INF_F32;
+        }
+
+        // ---- 3. Online softmax update ----
+        // new_m       = max(sharedM, score)
+        // l_scale     = exp(sharedM - new_m)         (rescales prior accumulators)
+        // weight      = exp(score - new_m)           (this position's weight)
+        // sharedL    *= l_scale; sharedL += weight
+        // sharedO[c] *= l_scale; sharedO[c] += weight * V[i, c]   (per thread)
+        // sharedM     = new_m
+        if (tid == 0u) {
+            let new_m = max(sharedM, score);
+            sharedScale  = exp(sharedM - new_m);
+            sharedWeight = exp(score    - new_m);
+            sharedL      = sharedL * sharedScale + sharedWeight;
+            sharedM      = new_m;
+        }
+        workgroupBarrier();
+
+        // All threads pick up the new scale / weight and update their
+        // slice of sharedO.
+        let l_scale = sharedScale;
+        let weight  = sharedWeight;
+        let v_row_base = kv_head_base + kv_idx * head_dim + tid * channels_per_thread;
+        for (var c = 0u; c < channels_per_thread; c++) {
+            let ch    = tid * channels_per_thread + c;
+            let v_val = v_input3[v_row_base + c];
+            sharedO[ch] = sharedO[ch] * l_scale + weight * v_val;
+        }
+        workgroupBarrier();
+    }
+
+    // ---- 4. Final write-back: O[c] = sharedO[c] / sharedL ----
+    let inv_l = 1.0 / sharedL;
+    let o_base = (batch * num_heads + head) * head_dim;
+    for (var c = 0u; c < channels_per_thread; c++) {
+        let ch = tid * channels_per_thread + c;
+        v_dest[o_base + ch] = sharedO[ch] * inv_l;
+    }
+}
+
+#endif
