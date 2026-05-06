@@ -175,6 +175,11 @@ impl Default for WgpuDeviceConfig {
 pub struct WgpuDeviceInner {
     pub device: wgpu::Device,
     pub backend: wgpu::Backend,
+    /// Adapter info captured at device creation. Vendor / device id /
+    /// architecture name / driver string. Read by higher layers to make
+    /// hardware-aware kernel choices (e.g. AMD GCN wave-64 vs NVIDIA
+    /// SM warp-32 matmul tile sizes — phase-6 work).
+    pub adapter_info: wgpu::AdapterInfo,
     pub device_limits: wgpu::Limits, // we cache the limits here because `device.limits()` was relatively slow in the browser
     device_features: wgpu::Features,
 
@@ -430,12 +435,14 @@ impl WgpuDevice {
             .max_buffer_size
             .min(device_limits.max_storage_buffer_binding_size as u64);
 
+        let adapter_info = adapter.get_info();
         Ok(WgpuDevice {
             inner: Arc::new(WgpuDeviceInner {
                 device,
                 device_limits,
                 device_features: features,
-                backend: adapter.get_info().backend,
+                backend: adapter_info.backend,
+                adapter_info,
                 queue,
                 #[cfg(feature = "wgpu_debug")]
                 debug_pipeline_performance: debug_info,
@@ -465,6 +472,42 @@ impl WgpuDevice {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn create(configuration: WgpuDeviceConfig) -> crate::Result<Self> {
         pollster::block_on(WgpuDevice::create_async(configuration))
+    }
+
+    /// `true` when the active adapter is an AMD GPU. Matches the PCI
+    /// vendor id (`0x1002`) on native; on WebGPU the browser may not
+    /// expose a real PCI id, so fall back to a substring match against
+    /// the adapter name. Used by hardware-aware kernel selection to
+    /// pick wave-64-friendly matmul variants on GCN/RDNA.
+    pub fn is_amd_adapter(&self) -> bool {
+        const AMD_PCI_VENDOR: u32 = 0x1002;
+        if self.adapter_info.vendor == AMD_PCI_VENDOR {
+            return true;
+        }
+        let name = self.adapter_info.name.to_lowercase();
+        name.contains("amd")
+            || name.contains("advanced micro devices")
+            || name.contains("radeon")
+    }
+
+    /// `true` when the active adapter is an NVIDIA GPU. Vendor id
+    /// `0x10DE` on native, name match on WebGPU.
+    pub fn is_nvidia_adapter(&self) -> bool {
+        const NVIDIA_PCI_VENDOR: u32 = 0x10DE;
+        if self.adapter_info.vendor == NVIDIA_PCI_VENDOR {
+            return true;
+        }
+        self.adapter_info.name.to_lowercase().contains("nvidia")
+    }
+
+    /// `true` when the active adapter is an Apple GPU (Metal /
+    /// AppleSilicon). Matches PCI vendor `0x106B`, an "apple" substring
+    /// in the adapter name, or a Metal backend.
+    pub fn is_apple_adapter(&self) -> bool {
+        const APPLE_PCI_VENDOR: u32 = 0x106B;
+        self.adapter_info.vendor == APPLE_PCI_VENDOR
+            || self.adapter_info.name.to_lowercase().contains("apple")
+            || matches!(self.adapter_info.backend, wgpu::Backend::Metal)
     }
 
     //allows to load const debug info(for simulating calls)

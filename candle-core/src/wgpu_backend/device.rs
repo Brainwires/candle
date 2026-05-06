@@ -34,10 +34,20 @@ impl WgpuDevice {
             candle_wgpu_kernels::DefaultWgpuShader::new()
         });
         device.set_extension(rand::rngs::StdRng::from_os_rng());
+        // Hardware-aware matmul preset. AMD GCN/RDNA uses 64-thread waves
+        // and prefers larger tiles aligned to wavefront boundaries; the
+        // 64×64 tile variant matches that. NVIDIA / Apple keep MatmulX
+        // (auto-select) which already routes M=1 decode through the
+        // matmul1x* kernels.
+        let matmul_alg = if device.is_amd_adapter() {
+            MatmulAlgorithm::Matmul64_64_8_8
+        } else {
+            MatmulAlgorithm::MatmulX
+        };
         Ok(WgpuDevice {
             inner_device: device,
             device_id: DEVICE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
-            matmul_alg: std::sync::Arc::new(std::sync::Mutex::new(MatmulAlgorithm::MatmulX)),
+            matmul_alg: std::sync::Arc::new(std::sync::Mutex::new(matmul_alg)),
         })
     }
 
