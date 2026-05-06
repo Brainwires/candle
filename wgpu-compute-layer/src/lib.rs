@@ -27,6 +27,12 @@ pub use wgpu_compute_layer_macro::create_loader;
     derive(serde::Serialize, serde::Deserialize)
 )]
 /// Numeric data types supported by this crate.
+///
+/// `BF16` is stored as 2 raw bytes per element (same layout as `F16`
+/// but a different float format — the top 16 bits of an IEEE 754 f32).
+/// The kernels read it back via `bitcast<f32>(u32(bits) << 16u)`, so
+/// no separate `bf16` arithmetic type is needed at the WGSL level —
+/// only at the load site.
 pub enum DType {
     F32,
     U32,
@@ -34,9 +40,10 @@ pub enum DType {
     I64,
     F64,
     F16,
+    BF16,
 }
 /// Number of variants in `DType`.
-pub const DTYPE_COUNT: u16 = 6;
+pub const DTYPE_COUNT: u16 = 7;
 
 impl DType {
     pub fn get_index(&self) -> u16 {
@@ -47,6 +54,7 @@ impl DType {
             DType::I64 => 3,
             DType::F64 => 4,
             DType::F16 => 5,
+            DType::BF16 => 6,
         }
     }
 
@@ -58,6 +66,7 @@ impl DType {
             3 => DType::I64,
             4 => DType::F64,
             5 => DType::F16,
+            6 => DType::BF16,
             _ => {
                 todo!()
             }
@@ -72,6 +81,7 @@ impl DType {
             DType::I64 => 8,
             DType::F64 => 8,
             DType::F16 => 2,
+            DType::BF16 => 2,
         }
     }
 }

@@ -18,6 +18,7 @@ impl From<candle_wgpu_kernels::DType> for crate::DType {
             candle_wgpu_kernels::DType::I64 => crate::DType::I64,
             candle_wgpu_kernels::DType::F64 => crate::DType::F64,
             candle_wgpu_kernels::DType::F16 => crate::DType::F16,
+            candle_wgpu_kernels::DType::BF16 => crate::DType::BF16,
         }
     }
 }
@@ -31,6 +32,7 @@ impl From<crate::DType> for candle_wgpu_kernels::DType {
             crate::DType::I64 => candle_wgpu_kernels::DType::I64,
             crate::DType::F64 => candle_wgpu_kernels::DType::F64,
             crate::DType::F16 => candle_wgpu_kernels::DType::F16,
+            crate::DType::BF16 => candle_wgpu_kernels::DType::BF16,
             _ => panic!("{val:?} is not supported in candle_wgpu_kernels"),
         }
     }

@@ -111,6 +111,7 @@ impl WgpuDevice {
             (crate::DType::I64, true) => Ok(DType::I64),
             (crate::DType::F64, true) => Ok(DType::F64),
             (crate::DType::F16, true) => Ok(DType::F16),
+            (crate::DType::BF16, true) => Ok(DType::BF16),
             (crate::DType::U8, _) => Err(crate::Error::from(format!(
                 "Dtype {:?} not supported on wgpu",
                 &dtype

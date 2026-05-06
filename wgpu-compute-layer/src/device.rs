@@ -590,6 +590,10 @@ impl WgpuDevice {
             DType::I64 => self.device_features.contains(wgpu::Features::SHADER_INT64),
             DType::F64 => self.device_features.contains(wgpu::Features::SHADER_F64),
             DType::F16 => self.device_features.contains(wgpu::Features::SHADER_F16),
+            // BF16 storage is just 2-byte buffer space; no shader
+            // feature needed (kernels load via bitcast<f32>(bits<<16)).
+            // Always available.
+            DType::BF16 => true,
         }
     }
 

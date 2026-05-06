@@ -109,6 +109,10 @@ impl From<crate::DType> for BindgroupAlignment {
             crate::DType::U32 => BindgroupAlignment::Aligned4,
             crate::DType::I64 => BindgroupAlignment::Aligned8,
             crate::DType::F16 => BindgroupAlignment::Aligned4,
+            // BF16 has the same byte width as F16 (2 bytes); kernels
+            // pack pairs into a u32 the same way, so the bind-group
+            // alignment requirement is identical.
+            crate::DType::BF16 => BindgroupAlignment::Aligned4,
             crate::DType::F32 => BindgroupAlignment::Aligned4,
             crate::DType::F64 => BindgroupAlignment::Aligned8,
         }

@@ -95,6 +95,15 @@ impl ShaderLoader for DefaultWgpuShader {
             DType::I64 => "i64",
             DType::F64 => "f64",
             DType::F16 => "f16",
+            // BF16 is stored as 2 bytes / element (like F16) but
+            // needs shift-load conversion in the shader. Kernels
+            // that opt into BF16 must define a `bf16` overload — at
+            // minimum, expose load-as-f32 via
+            // `bitcast<f32>(u32(bits) << 16u)`. Kernels without
+            // a `bf16` branch will fail at shader compile time
+            // (with a clearer error than the storage-layer panic
+            // we used to get).
+            DType::BF16 => "bf16",
         };
 
         #[cfg(target_arch = "wasm32")]
