@@ -47,11 +47,109 @@
 //! which needs an Ollama-published gemma4:e2b GGUF + matching
 //! reference run.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use candle::quantized::{gguf_file, QMatMul, QTensor};
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{CpuStorage, DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Activation, Embedding};
+
+/// Row-wise embedding lookup against a quantized table — equivalent to
+/// `ggml_get_rows(qtensor, ids)` in llama.cpp. Holds the QTensor as-is
+/// and dequantizes only the rows referenced by each forward call.
+///
+/// Why this exists: `Embedding::new(qtensor.dequantize(...))` materializes
+/// the full table in f32. For Gemma 4 E2B's `per_layer_token_embd` the
+/// shape is `[262144, num_layers * per_layer]` ≈ 2.0 G elements ≈ 8 GB
+/// f32, which overflows wasm32's 4 GB address space (`raw_vec`'s
+/// `capacity_overflow`). Keeping the table quantized (~1.1 GB at Q4_K_M)
+/// and dequantizing per-row at lookup is what makes Gemma 4 E2B fit
+/// in-browser.
+///
+/// Requires `cols % block_size == 0` so each row aligns to a whole
+/// number of quantization blocks (true for Gemma 4 E2B's PLE: 7680 cols
+/// / 256 block_size = 30 blocks/row).
+#[derive(Debug, Clone)]
+struct QEmbedding {
+    qtensor: Arc<QTensor>,
+    rows: usize,
+    cols: usize,
+    bytes_per_row: usize,
+}
+
+impl QEmbedding {
+    fn new(qtensor: QTensor) -> Result<Self> {
+        let dims = qtensor.shape().dims();
+        if dims.len() != 2 {
+            candle::bail!(
+                "QEmbedding expects a 2D quantized tensor, got shape {:?}",
+                dims
+            );
+        }
+        let rows = dims[0];
+        let cols = dims[1];
+        let dtype = qtensor.dtype();
+        let block_size = dtype.block_size();
+        let type_size = dtype.type_size();
+        if !cols.is_multiple_of(block_size) {
+            candle::bail!(
+                "QEmbedding: cols={} not a multiple of block_size={} for dtype {:?}",
+                cols,
+                block_size,
+                dtype
+            );
+        }
+        let blocks_per_row = cols / block_size;
+        let bytes_per_row = blocks_per_row * type_size;
+        Ok(Self {
+            qtensor: Arc::new(qtensor),
+            rows,
+            cols,
+            bytes_per_row,
+        })
+    }
+
+    fn forward(&self, indices: &Tensor) -> Result<Tensor> {
+        let target_dev = indices.device().clone();
+        let indices_cpu = if target_dev.is_cpu() {
+            indices.clone()
+        } else {
+            indices.to_device(&Device::Cpu)?
+        };
+        let flat = indices_cpu.flatten_all()?;
+        let ids: Vec<u32> = flat.to_vec1::<u32>()?;
+        let raw = self.qtensor.data()?;
+        let dtype = self.qtensor.dtype();
+        let mut out = Vec::<f32>::with_capacity(ids.len() * self.cols);
+        for &id in &ids {
+            let id_us = id as usize;
+            if id_us >= self.rows {
+                candle::bail!(
+                    "QEmbedding lookup: index {} out of range (rows={})",
+                    id,
+                    self.rows
+                );
+            }
+            let start = id_us * self.bytes_per_row;
+            let end = start + self.bytes_per_row;
+            let row_bytes = &raw[start..end];
+            let qtype = dtype.from_data(Cow::Borrowed(row_bytes));
+            let storage = qtype.dequantize(self.cols)?;
+            match storage {
+                CpuStorage::F32(v) => out.extend_from_slice(&v),
+                _ => candle::bail!("QEmbedding: dequantize returned non-F32 storage"),
+            }
+        }
+        let mut out_shape: Vec<usize> = indices.dims().to_vec();
+        out_shape.push(self.cols);
+        let result = Tensor::from_vec(out, out_shape, &Device::Cpu)?;
+        if target_dev.is_cpu() {
+            Ok(result)
+        } else {
+            result.to_device(&target_dev)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 enum KvCache {
@@ -486,10 +584,12 @@ impl AltUp {
 #[derive(Debug, Clone)]
 struct PerLayerEmbedding {
     /// `[vocab_per_layer, num_layers * hidden_per_layer]`, lookup
-    /// is the standard Embedding op. Optional — large publications
-    /// may skip this layer to save memory; without it the side-channel
-    /// is the projection alone (loses per-token PLE signal).
-    embed_tokens_per_layer: Option<Embedding>,
+    /// is row-wise on the quantized table (mirrors llama.cpp's
+    /// `ggml_get_rows(tok_embd_per_layer, ids)`). Optional — large
+    /// publications may skip this layer to save memory; without it
+    /// the side-channel is the projection alone (loses per-token
+    /// PLE signal).
+    embed_tokens_per_layer: Option<QEmbedding>,
     /// `[hidden_size, num_layers * hidden_per_layer]` projection of
     /// the main `inputs_embeds` into the same flat space.
     per_layer_model_projection: QMatMul,
@@ -515,17 +615,15 @@ impl PerLayerEmbedding {
         let proj = self.per_layer_projection_norm.forward(&proj)?;
         let merged = match &self.embed_tokens_per_layer {
             Some(embed) => {
-                // Same WGPU max-buffer concern as the main embed —
-                // the PLE table is pinned to CPU when the inference
-                // device is WGPU. Lookup on CPU; move result back.
-                let proj_dev = proj.device();
-                let table = if proj_dev.is_wgpu()
-                    && !embed.embeddings().device().is_wgpu()
-                {
-                    let ids_cpu = input_ids.to_device(&Device::Cpu)?;
-                    embed.forward(&ids_cpu)?.to_device(proj_dev)?
+                // QEmbedding does row-wise dequant on CPU and moves the
+                // (small) result back to `input_ids.device()`. We then
+                // bring it onto `proj.device()` so the broadcast_add is
+                // a same-device op.
+                let table = embed.forward(input_ids)?;
+                let table = if table.device().same_device(proj.device()) {
+                    table
                 } else {
-                    embed.forward(input_ids)?
+                    table.to_device(proj.device())?
                 };
                 let table = table.reshape((b, t, self.num_hidden_layers, self.hidden_per_layer))?;
                 // HF wraps embed_tokens_per_layer in
@@ -1145,18 +1243,20 @@ impl ModelWeights {
                     })?,
                     cfg.rms_norm_eps,
                 )?;
-                // Same WGPU max-buffer concern as `token_embd.weight` —
-                // `per_layer_token_embd` is `[vocab × num_layers × per_layer]`
-                // which on Gemma 4 E2B is also multi-GB. Load the QTensor
-                // onto CPU directly when the inference device is WGPU so
-                // dequantize allocates on CPU, not on the over-cap WGPU.
-                let ple_storage_dev = if device.is_wgpu() { &Device::Cpu } else { device };
+                // Per-layer token embed is `[vocab × num_layers × per_layer]`
+                // — for Gemma 4 E2B this dequantizes to ~8 GB f32, which
+                // overflows wasm32's 4 GB address space. Even on native
+                // WGPU it would bust `max_storage_buffer_binding_size`.
+                // Keep the QTensor on CPU and use `QEmbedding` for
+                // row-wise dequant at lookup time (mirrors llama.cpp's
+                // `ggml_get_rows`). Allocation footprint stays at the
+                // quantized size (~1.1 GB at Q4_K_M).
+                let _ = total; // shape now derived from QTensor inside QEmbedding
                 let embed_tokens_per_layer = ct
-                    .tensor(reader, "per_layer_token_embd.weight", ple_storage_dev)
-                    .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", ple_storage_dev))
+                    .tensor(reader, "per_layer_token_embd.weight", &Device::Cpu)
+                    .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", &Device::Cpu))
                     .ok()
-                    .and_then(|t| t.dequantize(ple_storage_dev).ok())
-                    .map(|w| Embedding::new(w, total));
+                    .and_then(|t| QEmbedding::new(t).ok());
                 Ok(PerLayerEmbedding {
                     embed_tokens_per_layer,
                     per_layer_model_projection,
