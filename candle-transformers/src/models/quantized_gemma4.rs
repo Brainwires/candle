@@ -23,11 +23,21 @@
 //!   → projection → norm → +residual`. Wired through every
 //!   `DecoderLayer`; falls back to a no-op when the GGUF doesn't
 //!   carry `per_layer_model_proj.weight`.
+//! - **AltUp (Alternating Updates)** — multi-stream forward with
+//!   `altup_num_inputs` parallel hidden streams. Top-level
+//!   `altup_projections` build the stack from the input embeddings;
+//!   each `DecoderLayer` runs predict → activate (attn+laurel+MLP on
+//!   the active stream) → correct over the full stack; top-level
+//!   `altup_unembed_projections` collapse the stack back to a single
+//!   stream before the final RmsNorm + lm_head. Falls back to the
+//!   classic single-stream path when the GGUF doesn't carry the
+//!   AltUp tensors.
 //!
-//! **Not yet ported** (gated off via `Gemma4TextConfig::disable_altup`):
-//! - AltUp (Alternating Updates) — needs multi-stream forward
-//!   restructuring (predict/activate/correct over `altup_num_inputs`
-//!   parallel hidden streams).
+//! Every Gemma 4 / Gemma 3n auxiliary tower is now ported. The remaining
+//! validation step is reference correctness against an actual
+//! Ollama-published gemma4:e2b GGUF — the tensor name conventions
+//! (especially for AltUp / PLE / Laurel) are llama.cpp-style guesses
+//! and may need adjustment when the first real GGUF is loaded.
 //!
 //! Output won't match Gemma 4 reference exactly with the auxiliary
 //! towers off — this scaffold exists to exercise the QMatMul + GGUF
@@ -370,6 +380,83 @@ impl Attention {
     }
 }
 
+// ── AltUp (Alternating Updates) ────────────────────────────────────────────
+//
+// Maintains `altup_num_inputs` parallel hidden streams. Each layer
+// runs predict → activate (the layer's main attn+MLP path on the
+// active stream) → correct over the full stack, returning the
+// corrected stack for the next layer. Mirrors HF
+// `Gemma3nTextAltUp`.
+
+#[derive(Debug, Clone)]
+struct AltUp {
+    correct_output_scale: Tensor,
+    correction_coefs: QMatMul,
+    prediction_coefs: QMatMul,
+    modality_router: QMatMul,
+    router_norm: RmsNorm,
+    /// `1 / hidden_size` — applied to the modality vector before the
+    /// router projection.
+    router_input_scale: f64,
+    altup_num_inputs: usize,
+    altup_active_idx: usize,
+}
+
+impl AltUp {
+    /// `tanh(modality_router(router_norm(x) * router_input_scale))`.
+    fn compute_router_modalities(&self, x: &Tensor) -> Result<Tensor> {
+        let normed = self.router_norm.forward(x)?;
+        let scaled = (normed * self.router_input_scale)?;
+        let routed = self.modality_router.forward(&scaled)?;
+        routed.tanh()
+    }
+
+    /// `predict(stack) -> stack + (predicted_residual_per_input)`.
+    /// `stack` shape: `[num_inputs, B, T, hidden]`.
+    fn predict(&self, stack: &Tensor) -> Result<Tensor> {
+        let active = stack.i(self.altup_active_idx)?;
+        let modalities = self.compute_router_modalities(&active)?; // [B, T, num_inputs]
+
+        let coefs = self.prediction_coefs.forward(&modalities)?; // [B, T, num_inputs²]
+        let bt = coefs.dims();
+        let (b, t) = (bt[0], bt[1]);
+        let coefs = coefs
+            .reshape((b, t, self.altup_num_inputs, self.altup_num_inputs))?
+            .transpose(2, 3)?;
+
+        let permuted = stack.permute((1, 2, 3, 0))?.contiguous()?;
+        let predicted = permuted.matmul(&coefs.contiguous()?)?;
+        let predicted = predicted.permute((3, 0, 1, 2))?.contiguous()?;
+        let result = (predicted + stack)?;
+        result.contiguous()
+    }
+
+    /// `correct(predictions, activated)`. Predictions: `[num_inputs, B, T, H]`,
+    /// activated: `[B, T, H]`. Returns `[num_inputs, B, T, H]`.
+    fn correct(&self, predictions: &Tensor, activated: &Tensor) -> Result<Tensor> {
+        let modalities = self.compute_router_modalities(activated)?; // [B, T, num_inputs]
+        let active_pred = predictions.i(self.altup_active_idx)?;
+        let innovation = (activated - &active_pred)?;
+        let innovation = innovation
+            .unsqueeze(0)?
+            .broadcast_as(predictions.shape())?
+            .contiguous()?;
+
+        let coefs = self.correction_coefs.forward(&modalities)?; // [B, T, num_inputs]
+        let coefs = (coefs + 1.0)?;
+        let coefs = coefs.permute((2, 0, 1))?.unsqueeze(3)?.contiguous()?;
+
+        let scaled = innovation.broadcast_mul(&coefs)?;
+        let corrected = (scaled + predictions)?;
+        corrected.contiguous()
+    }
+
+    /// Multiplies the active stream by the learnable per-feature scale.
+    fn scale_corrected_output(&self, x: &Tensor) -> Result<Tensor> {
+        x.broadcast_mul(&self.correct_output_scale)
+    }
+}
+
 // ── PerLayerEmbedding (PLE side-channel) ────────────────────────────────────
 //
 // Computed once per step from input_ids + inputs_embeds, returns a
@@ -453,6 +540,13 @@ struct DecoderLayer {
     post_per_layer_input_norm: Option<RmsNorm>,
     /// Activation for the PLE gate (matches `cfg.hidden_activation`).
     per_layer_act: Activation,
+    /// AltUp wiring. `None` for non-3n configs; the layer falls back
+    /// to the classic single-stream forward.
+    altup: Option<AltUp>,
+    /// When `true` (the trained default for Gemma 3n), AltUp's
+    /// corrected active prediction is multiplied by
+    /// `correct_output_scale` before feeding into the PLE gate.
+    altup_correct_scale: bool,
 }
 
 impl DecoderLayer {
@@ -465,6 +559,17 @@ impl DecoderLayer {
         shared_kv_store: &mut SharedKvStore,
         per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
+        if self.altup.is_some() {
+            return self.forward_altup(
+                xs,
+                attention_mask,
+                sliding_attention_mask,
+                seqlen_offset,
+                shared_kv_store,
+                per_layer_input,
+            );
+        }
+        // ── Classic / Gemma 4 path (no AltUp wiring) ────────────────────
         let residual = xs;
         let normed_input = self.input_layernorm.forward(xs)?;
         let attn = self.self_attn.forward(
@@ -520,6 +625,85 @@ impl DecoderLayer {
         }
     }
 
+    /// AltUp forward — `xs` is `[num_inputs, B, T, hidden]`, returns
+    /// the corrected stack of the same shape. Predict → activate
+    /// (attn+laurel+MLP on the active stream) → correct → PLE delta
+    /// applied to all-but-active streams.
+    fn forward_altup(
+        &mut self,
+        xs: &Tensor,
+        attention_mask: Option<&Tensor>,
+        sliding_attention_mask: Option<&Tensor>,
+        seqlen_offset: usize,
+        shared_kv_store: &mut SharedKvStore,
+        per_layer_input: Option<&Tensor>,
+    ) -> Result<Tensor> {
+        let altup = self.altup.as_ref().expect("AltUp branch entered without altup");
+
+        let predictions = altup.predict(xs)?;
+        let active = predictions.i(altup.altup_active_idx)?;
+        let active_norm = self.input_layernorm.forward(&active)?;
+
+        let laurel_out = if let Some(laurel) = &self.laurel {
+            Some(laurel.forward(&active_norm)?)
+        } else {
+            None
+        };
+
+        let attn = self.self_attn.forward(
+            &active_norm,
+            attention_mask,
+            sliding_attention_mask,
+            seqlen_offset,
+            shared_kv_store,
+        )?;
+        let attn = self.post_attention_layernorm.forward(&attn)?;
+        let attn_gated = (active + attn)?;
+        let attn_laurel = match laurel_out {
+            Some(l) => ((attn_gated + l)? * self.inv_sqrt_2)?,
+            None => attn_gated,
+        };
+
+        let attn_norm = self.pre_feedforward_layernorm.forward(&attn_laurel)?;
+        let ffw = self.mlp.forward(&attn_norm)?;
+        let ffw = self.post_feedforward_layernorm.forward(&ffw)?;
+        let attn_ffw_laurel_gated = (attn_laurel + ffw)?;
+
+        let mut corrected = altup.correct(&predictions, &attn_ffw_laurel_gated)?;
+
+        // PLE consumption: apply the side-channel to corrected[active_idx],
+        // then add the result back to corrected[i!=active_idx].
+        if let (Some(gate), Some(proj), Some(norm), Some(per_layer_input)) = (
+            self.per_layer_input_gate.as_ref(),
+            self.per_layer_projection.as_ref(),
+            self.post_per_layer_input_norm.as_ref(),
+            per_layer_input,
+        ) {
+            let mut first = corrected.i(altup.altup_active_idx)?.contiguous()?;
+            if self.altup_correct_scale {
+                first = altup.scale_corrected_output(&first)?;
+            }
+            let first = gate.forward(&first)?;
+            let first = first.apply(&self.per_layer_act)?;
+            let first = first.broadcast_mul(per_layer_input)?;
+            let first = proj.forward(&first)?;
+            let first = norm.forward(&first)?;
+            let n = altup.altup_num_inputs;
+            let mut slices: Vec<Tensor> = Vec::with_capacity(n);
+            for i in 0..n {
+                if i == altup.altup_active_idx {
+                    slices.push(first.zeros_like()?);
+                } else {
+                    slices.push(first.clone());
+                }
+            }
+            let delta = Tensor::stack(&slices, 0)?;
+            corrected = (corrected + delta)?;
+        }
+
+        Ok(corrected)
+    }
+
     fn clear_kv_cache(&mut self) { self.self_attn.clear_kv_cache(); }
 }
 
@@ -539,6 +723,15 @@ pub struct ModelWeights {
     /// `√hidden_size` — Gemma input embeddings are scaled by this
     /// before entering the decoder stack.
     embed_scale: f64,
+    /// AltUp project / unproject linears. `Some` when AltUp is wired
+    /// (cfg.altup_num_inputs > 1 && !cfg.disable_altup) and all
+    /// tensors loaded successfully. `altup_projections.len() ==
+    /// altup_unembed_projections.len() == altup_num_inputs - 1` —
+    /// the active stream uses the original `inputs_embeds` directly.
+    altup_projections: Option<Vec<QMatMul>>,
+    altup_unembed_projections: Option<Vec<QMatMul>>,
+    altup_num_inputs: usize,
+    altup_active_idx: usize,
     device: Device,
     dtype: DType,
     cfg: Gemma4TextConfig,
@@ -761,6 +954,49 @@ impl ModelWeights {
                     (None, None, None)
                 };
 
+            // AltUp — Gemma 3n auxiliary tower. Construction is
+            // fault-tolerant: any missing tensor falls back to no
+            // AltUp wiring on this layer.
+            let altup = if cfg.altup_num_inputs > 1 && !cfg.disable_altup {
+                let mut try_altup = || -> Result<AltUp> {
+                    let correct_output_scale = ct
+                        .tensor(reader, &format!("{prefix}.altup_correct_output_scale"), device)?
+                        .dequantize(device)?;
+                    let correction_coefs = QMatMul::from_qtensor(ct.tensor(
+                        reader,
+                        &format!("{prefix}.altup_correction_coefs.weight"),
+                        device,
+                    )?)?;
+                    let prediction_coefs = QMatMul::from_qtensor(ct.tensor(
+                        reader,
+                        &format!("{prefix}.altup_prediction_coefs.weight"),
+                        device,
+                    )?)?;
+                    let modality_router = QMatMul::from_qtensor(ct.tensor(
+                        reader,
+                        &format!("{prefix}.altup_modality_router.weight"),
+                        device,
+                    )?)?;
+                    let router_norm = RmsNorm::from_qtensor(
+                        ct.tensor(reader, &format!("{prefix}.altup_router_norm.weight"), device)?,
+                        cfg.rms_norm_eps,
+                    )?;
+                    Ok(AltUp {
+                        correct_output_scale,
+                        correction_coefs,
+                        prediction_coefs,
+                        modality_router,
+                        router_norm,
+                        router_input_scale: (cfg.hidden_size as f64).powf(-1.0),
+                        altup_num_inputs: cfg.altup_num_inputs,
+                        altup_active_idx: cfg.altup_active_idx,
+                    })
+                };
+                try_altup().ok()
+            } else {
+                None
+            };
+
             layers.push(DecoderLayer {
                 self_attn,
                 mlp,
@@ -775,8 +1011,44 @@ impl ModelWeights {
                 per_layer_projection,
                 post_per_layer_input_norm,
                 per_layer_act: cfg.hidden_activation,
+                altup,
+                altup_correct_scale: cfg.altup_correct_scale,
             });
         }
+
+        // Top-level AltUp project / unproject linears (one per
+        // non-active stream). Names follow llama.cpp convention:
+        // `altup_proj.{i}.weight` and `altup_unembd_proj.{i}.weight`
+        // for i in 0..altup_num_inputs-1.
+        let (altup_projections, altup_unembed_projections) =
+            if cfg.altup_num_inputs > 1 && !cfg.disable_altup {
+                let mut try_top_altup = || -> Result<(Vec<QMatMul>, Vec<QMatMul>)> {
+                    let n = cfg.altup_num_inputs - 1;
+                    let mut projs = Vec::with_capacity(n);
+                    let mut unembeds = Vec::with_capacity(n);
+                    for i in 0..n {
+                        let proj = QMatMul::from_qtensor(ct.tensor(
+                            reader,
+                            &format!("altup_proj.{i}.weight"),
+                            device,
+                        )?)?;
+                        let unembed = QMatMul::from_qtensor(ct.tensor(
+                            reader,
+                            &format!("altup_unembd_proj.{i}.weight"),
+                            device,
+                        )?)?;
+                        projs.push(proj);
+                        unembeds.push(unembed);
+                    }
+                    Ok((projs, unembeds))
+                };
+                match try_top_altup() {
+                    Ok((p, u)) => (Some(p), Some(u)),
+                    Err(_) => (None, None),
+                }
+            } else {
+                (None, None)
+            };
 
         // Build the PLE side-channel computer if config enables it.
         // Loads `per_layer_model_proj.weight` (the [hidden, num_layers *
@@ -824,6 +1096,10 @@ impl ModelWeights {
             lm_head,
             per_layer_embedding,
             embed_scale: (cfg.hidden_size as f64).sqrt(),
+            altup_projections,
+            altup_unembed_projections,
+            altup_num_inputs: cfg.altup_num_inputs,
+            altup_active_idx: cfg.altup_active_idx,
             device: device.clone(),
             dtype,
             cfg: cfg.clone(),
@@ -871,21 +1147,73 @@ impl ModelWeights {
         let mut shared_kv_store: SharedKvStore =
             (0..self.cfg.num_hidden_layers).map(|_| None).collect();
 
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-            let per_layer_input = match &per_layer_table {
-                Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
-                None => None,
-            };
-            hidden = layer.forward(
-                &hidden,
-                attention_mask.as_ref(),
-                sliding_attention_mask.as_ref(),
-                seqlen_offset,
-                &mut shared_kv_store,
-                per_layer_input.as_ref(),
-            )?;
-        }
-        let hidden = self.norm.forward(&hidden)?;
+        let altup_active = self.altup_projections.is_some()
+            && self.altup_unembed_projections.is_some()
+            && self.altup_num_inputs > 1;
+
+        let hidden = if altup_active {
+            // Project the original hidden into a stack of altup_num_inputs
+            // streams. Active stream is `hidden`; other streams come
+            // from `altup_projections[i]`.
+            let projs = self.altup_projections.as_ref().unwrap();
+            let mut streams: Vec<Tensor> = Vec::with_capacity(self.altup_num_inputs);
+            for i in 0..self.altup_num_inputs {
+                if i == self.altup_active_idx {
+                    streams.push(hidden.clone());
+                } else {
+                    let idx = if i < self.altup_active_idx { i } else { i - 1 };
+                    streams.push(projs[idx].forward(&hidden)?);
+                }
+            }
+            let mut stack = Tensor::stack(&streams, 0)?.contiguous()?;
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let per_layer_input = match &per_layer_table {
+                    Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
+                    None => None,
+                };
+                stack = layer.forward(
+                    &stack,
+                    attention_mask.as_ref(),
+                    sliding_attention_mask.as_ref(),
+                    seqlen_offset,
+                    &mut shared_kv_store,
+                    per_layer_input.as_ref(),
+                )?;
+            }
+            // Unproject: `out = active + sum(unembed_projections[i](stack[i]))`
+            // for i != active_idx. The trained model treats the active
+            // stream as the canonical prediction and the others as
+            // residual corrections.
+            let unembeds = self.altup_unembed_projections.as_ref().unwrap();
+            let active_out = stack.i(self.altup_active_idx)?;
+            let mut acc = active_out.contiguous()?;
+            for i in 0..self.altup_num_inputs {
+                if i == self.altup_active_idx {
+                    continue;
+                }
+                let idx = if i < self.altup_active_idx { i } else { i - 1 };
+                let stream = stack.i(i)?;
+                let unembedded = unembeds[idx].forward(&stream)?;
+                acc = (acc + unembedded)?;
+            }
+            self.norm.forward(&acc)?
+        } else {
+            for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                let per_layer_input = match &per_layer_table {
+                    Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
+                    None => None,
+                };
+                hidden = layer.forward(
+                    &hidden,
+                    attention_mask.as_ref(),
+                    sliding_attention_mask.as_ref(),
+                    seqlen_offset,
+                    &mut shared_kv_store,
+                    per_layer_input.as_ref(),
+                )?;
+            }
+            self.norm.forward(&hidden)?
+        };
         // Take the last token only for autoregressive sampling — same as
         // gemma4/text.rs.
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
