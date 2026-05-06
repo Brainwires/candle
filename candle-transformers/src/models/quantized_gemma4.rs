@@ -278,11 +278,14 @@ impl Attention {
         let (b_sz, q_len, _) = xs.dims3()?;
 
         // Q is always projected from the layer's own input — receivers
-        // share K/V with their donor but keep their own Q.
+        // share K/V with their donor but keep their own Q. RmsNorm
+        // requires contiguous input; the reshape+transpose may yield a
+        // non-contiguous tensor (q_len > 1 prefill case).
         let q = self.q_proj.forward(xs)?;
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
+            .transpose(1, 2)?
+            .contiguous()?;
         let q = self.q_norm.forward(&q)?;
 
         // Q's RoPE comes from THIS layer's RoPE table either way. For
@@ -326,10 +329,12 @@ impl Attention {
             let v = v_proj.forward(xs)?;
             let k = k
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
+                .transpose(1, 2)?
+                .contiguous()?;
             let v = v
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
-                .transpose(1, 2)?;
+                .transpose(1, 2)?
+                .contiguous()?;
             let k = k_norm.forward(&k)?;
             let v = v_norm(&v, self.rms_norm_eps)?;
             // q and k must share the rotated dimension; co-rotate.
