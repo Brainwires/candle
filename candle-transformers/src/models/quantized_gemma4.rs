@@ -120,6 +120,16 @@ impl QEmbedding {
         }
         let blocks_per_row = cols / block_size;
         let bytes_per_row = blocks_per_row * type_size;
+        let storage_size = qtensor.storage_size_in_bytes();
+        let expected_size = rows * bytes_per_row;
+        wasm_trace!(
+            "QEmbedding::new shape=[{rows}, {cols}] dtype={dtype:?} \
+             block_size={block_size} type_size={type_size} \
+             blocks_per_row={blocks_per_row} bytes_per_row={bytes_per_row} \
+             storage_size={storage_size} expected_size={expected_size} \
+             match={}",
+            storage_size == expected_size,
+        );
         Ok(Self {
             qtensor: Arc::new(qtensor),
             rows,
@@ -139,6 +149,17 @@ impl QEmbedding {
         let ids: Vec<u32> = flat.to_vec1::<u32>()?;
         let raw = self.qtensor.data()?;
         let dtype = self.qtensor.dtype();
+        let preview_n = ids.len().min(8);
+        wasm_trace!(
+            "QEmbedding::forward ids[..{preview_n}]={:?} ids.len={} \
+             raw.len={} bytes_per_row={} rows={} cols={}",
+            &ids[..preview_n],
+            ids.len(),
+            raw.len(),
+            self.bytes_per_row,
+            self.rows,
+            self.cols,
+        );
         let mut out = Vec::<f32>::with_capacity(ids.len() * self.cols);
         for &id in &ids {
             let id_us = id as usize;
@@ -151,6 +172,17 @@ impl QEmbedding {
             }
             let start = id_us * self.bytes_per_row;
             let end = start + self.bytes_per_row;
+            if end > raw.len() {
+                candle::bail!(
+                    "QEmbedding row OOB: id={id} start={start} end={end} \
+                     bytes_per_row={} rows={} raw.len={} (dims=[{}, {}])",
+                    self.bytes_per_row,
+                    self.rows,
+                    raw.len(),
+                    self.rows,
+                    self.cols,
+                );
+            }
             let row_bytes = &raw[start..end];
             let qtype = dtype.from_data(Cow::Borrowed(row_bytes));
             let storage = qtype.dequantize(self.cols)?;
