@@ -52,7 +52,7 @@ use std::sync::Arc;
 
 use candle::quantized::{gguf_file, QMatMul, QTensor};
 use candle::{CpuStorage, DType, Device, IndexOp, Module, Result, Tensor, D};
-use candle_nn::{Activation, Embedding};
+use candle_nn::Activation;
 
 /// Row-wise embedding lookup against a quantized table — equivalent to
 /// `ggml_get_rows(qtensor, ids)` in llama.cpp. Holds the QTensor as-is
@@ -837,7 +837,7 @@ impl DecoderLayer {
 // ── ModelWeights (top-level) ────────────────────────────────────────────────
 
 pub struct ModelWeights {
-    embed_tokens: Embedding,
+    embed_tokens: QEmbedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: QMatMul,
@@ -895,27 +895,22 @@ impl ModelWeights {
         )?);
 
         // Top-level tensors.
-        // `token_embd.weight` for Gemma 4 E2B dequantizes to ~1.5 GB at
-        // f32 (262144 vocab × hidden × 4 B). That exceeds
-        // `max_storage_buffer_binding_size` on most WebGPU adapters
-        // (1 GB on Apple Silicon / AMD; 256 MB on some Intel iGPUs),
-        // and the device-side allocation panics with
-        // "tried to create too large a buffer".
+        // `token_embd.weight` for Gemma 4 E2B is `[262144, hidden_size]`
+        // — at hidden=2048 it dequantizes to ~2.1 GB f32. On WGPU that
+        // overflows the 1 GB `max_storage_buffer_binding_size` cap; on
+        // wasm32 + CPU it eats half the 4 GB address space and pushes
+        // the rest of the model (PLE Q4_K_M ~1.1 GB + 35 layers Q4_K_M
+        // ~1.4 GB + activations) over the ceiling, which traps as
+        // "unreachable" before any user-visible log.
         //
-        // `QTensor::dequantize(target_dev)` allocates the dequantized
-        // output on the QTensor's *storage* device first, then moves
-        // — so passing CPU as `target_dev` after loading the QTensor
-        // onto WGPU still busts the buffer-size cap on the way through.
-        // Load the QTensor itself onto CPU instead, dequantize CPU→CPU,
-        // and keep the embedding pinned there. The lookup result is
-        // small (B*T*hidden bytes) and gets moved to `device` at the
-        // start of `Model::forward_inner`.
-        let embed_storage_dev = if device.is_wgpu() { &Device::Cpu } else { device };
-        let tok_q = ct.tensor(reader, "token_embd.weight", embed_storage_dev)?;
-        let embed_tokens = Embedding::new(
-            tok_q.dequantize(embed_storage_dev)?,
-            cfg.hidden_size,
-        );
+        // Use `QEmbedding` (the same trick we use for PLE) — keeps
+        // token_embd in its quantized form (~302 MB at Q4_K_M) and
+        // dequantizes only the rows looked up per forward call, just
+        // like llama.cpp's `ggml_get_rows(model.tok_embd, ids)`. The
+        // QTensor lives on CPU regardless of `device`; lookup results
+        // get moved to whatever device the indices are on.
+        let tok_q = ct.tensor(reader, "token_embd.weight", &Device::Cpu)?;
+        let embed_tokens = QEmbedding::new(tok_q)?;
         let norm_q = ct.tensor(reader, "output_norm.weight", device)?;
         let norm = RmsNorm::from_qtensor(norm_q, cfg.rms_norm_eps)?;
         let lm_head_q = match ct.tensor(reader, "output.weight", device) {
@@ -1293,20 +1288,14 @@ impl ModelWeights {
     /// `[b, q_len, vocab_size]` logits.
     pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, q_len) = xs.dims2()?;
-        // The big `token_embd.weight` table is pinned to CPU when the
-        // model device is WGPU (see ModelWeights::from_gguf — it would
-        // otherwise overflow max_storage_buffer_binding_size). Run the
-        // embed lookup on CPU in that case and move the small result
-        // back to device.
-        let inputs_embeds = if self.device.is_wgpu()
-            && !self.embed_tokens.embeddings().device().is_wgpu()
-        {
-            let xs_cpu = xs.to_device(&Device::Cpu)?;
-            self.embed_tokens
-                .forward(&xs_cpu)?
-                .to_device(&self.device)?
+        // QEmbedding does the row-wise dequant on CPU and returns the
+        // (small) result on `xs.device()`. Move to `self.device` so
+        // every downstream op sees a same-device tensor.
+        let inputs_embeds = self.embed_tokens.forward(xs)?;
+        let inputs_embeds = if inputs_embeds.device().same_device(&self.device) {
+            inputs_embeds
         } else {
-            self.embed_tokens.forward(xs)?
+            inputs_embeds.to_device(&self.device)?
         };
         // Gemma scale: input embeddings are multiplied by sqrt(hidden_size).
         let mut hidden = (inputs_embeds.clone() * self.embed_scale)?;
