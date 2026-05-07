@@ -2301,6 +2301,12 @@ pub fn matmul<T: GgmlType>(
         let lhs_row = &lhs_b[row_idx * k_in_blocks..(row_idx + 1) * k_in_blocks];
         let dst_row = &mut dst[row_idx * n..(row_idx + 1) * n];
 
+        // wasm32-unknown-unknown without atomics+threads can't host
+        // a real rayon thread pool; `into_par_iter` traps as
+        // `unreachable` the first time it tries to spin one up. Run
+        // sequentially in the browser instead — there's only one
+        // thread to use anyway.
+        #[cfg(not(target_arch = "wasm32"))]
         dst_row
             .into_par_iter()
             .enumerate()
@@ -2310,6 +2316,12 @@ pub fn matmul<T: GgmlType>(
                 let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
                 *dst = T::vec_dot(k, rhs_col, lhs_row);
             });
+
+        #[cfg(target_arch = "wasm32")]
+        for (col_idx, dst) in dst_row.iter_mut().enumerate() {
+            let rhs_col = &rhs_t[col_idx * k_in_blocks..(col_idx + 1) * k_in_blocks];
+            *dst = T::vec_dot(k, rhs_col, lhs_row);
+        }
     }
     Ok(())
 }
