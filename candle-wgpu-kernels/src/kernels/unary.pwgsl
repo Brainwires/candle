@@ -159,13 +159,30 @@ fn set_unary_bf16(operation : u32, id : u32, x : f32, scalar1 : f32, scalar2 : f
         case 38u{ // ReLU
             BF16_STORE_ATOMIC(v_dest, id, max(0.0, x));
         }
-        case 41u{ // SiLU
-            BF16_STORE_ATOMIC(v_dest, id, x / (1.0 + exp(-x)));
+        case 41u{ // SiLU — numerically safe across the f32 range. The
+                  // naive `x / (1 + exp(-x))` returns NaN on Apple Metal /
+                  // AMD Radeon Pro 555 when `-x` lands outside the GPU's
+                  // exp() range and the implementation produces NaN
+                  // instead of the IEEE-spec inf. The two-branch form
+                  // keeps `exp` arg ≤ 0, where it always lies in [0, 1].
+            if (x >= 0.0) {
+                BF16_STORE_ATOMIC(v_dest, id, x / (1.0 + exp(-x)));
+            } else {
+                let e = exp(x);
+                BF16_STORE_ATOMIC(v_dest, id, x * e / (1.0 + e));
+            }
         }
         case 45u{ BF16_STORE_ATOMIC(v_dest, id, -x); }
         case 46u{ BF16_STORE_ATOMIC(v_dest, id, 1.0 / x); }
-        case 49u{ // Gelu (tanh approx)
-            BF16_STORE_ATOMIC(v_dest, id, 0.5 * x * (1.0 + tanh(SQRT_TWO_OVER_PI * x * (1.0 + 0.044715 * x * x))));
+        case 49u{ // Gelu — short-circuit at saturation (see f32 path).
+            let _g_arg = SQRT_TWO_OVER_PI * x * (1.0 + 0.044715 * x * x);
+            if (_g_arg > 8.0) {
+                BF16_STORE_ATOMIC(v_dest, id, x);
+            } else if (_g_arg < -8.0) {
+                BF16_STORE_ATOMIC(v_dest, id, 0.0);
+            } else {
+                BF16_STORE_ATOMIC(v_dest, id, 0.5 * x * (1.0 + tanh(_g_arg)));
+            }
         }
         case 100u{ // set scalar
             BF16_STORE_ATOMIC(v_dest, id, scalar1);
@@ -307,8 +324,13 @@ fn set_unary(operation : u32, id : u32, x : DTYPE, scalar1 : f32, scalar2 : f32)
             else{
                 v_dest[id] = x;
             }
-        }case 41u{ //SiLU
-            v_dest[id] = x / (1 + exp(-x));
+        }case 41u{ //SiLU — numerically safe (see bf16 path comment).
+            if (x >= 0.0) {
+                v_dest[id] = x / (1.0 + exp(-x));
+            } else {
+                let e = exp(x);
+                v_dest[id] = x * e / (1.0 + e);
+            }
         }
         case 42u{ //Gaussian
             v_dest[id] = exp(-(x * x));
@@ -319,8 +341,21 @@ fn set_unary(operation : u32, id : u32, x : DTYPE, scalar1 : f32, scalar2 : f32)
         case 46u{ //inverse
             v_dest[id] = 1 / x;
         }
-        case 49u{//Gelu
-            v_dest[id] = 0.5 * x * (1.0 + tanh(SQRT_TWO_OVER_PI_F32 * x * (1.0 + 0.044715 * x * x)));
+        case 49u{ //Gelu — short-circuit when the tanh arg saturates.
+                  // Apple Metal / AMD Radeon Pro 555 implement tanh as
+                  // `(exp(x)-exp(-x))/(exp(x)+exp(-x))` which overflows
+                  // to inf/inf=NaN well before the f32 limit (observed
+                  // failures for arg > ~10 at f32 precision). Above
+                  // ±8 the hardware-saturated value of tanh is ±1 to
+                  // 8 decimal places, so we substitute sign(arg).
+            let g_arg = SQRT_TWO_OVER_PI_F32 * x * (1.0 + 0.044715 * x * x);
+            if (g_arg > 8.0) {
+                v_dest[id] = x;
+            } else if (g_arg < -8.0) {
+                v_dest[id] = 0.0;
+            } else {
+                v_dest[id] = 0.5 * x * (1.0 + tanh(g_arg));
+            }
         }
         case 50u{
             //round away from zero, //wgsl round would be round to even

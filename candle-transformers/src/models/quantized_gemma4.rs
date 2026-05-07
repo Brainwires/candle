@@ -328,22 +328,45 @@ struct MLP {
 
 impl MLP {
     fn forward_inner(&self, xs: &Tensor) -> Result<Tensor> {
+        let nan_diag = std::env::var("CANDLE_NAN_DIAG").is_ok();
+        macro_rules! mlp_check {
+            ($t:expr, $label:expr) => {
+                if nan_diag {
+                    let chk = $t.flatten_all()?.to_dtype(candle::DType::F32)?;
+                    let v: Vec<f32> = chk.to_vec1()?;
+                    let nan_n = v.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!("[nan-diag/mlp] {}: non-finite={}/{}", $label, nan_n, v.len());
+                }
+            };
+        }
+        mlp_check!(xs, "in");
         let mut gate = self.gate_proj.forward(xs)?;
+        mlp_check!(gate, "gate_proj");
         if self.sparsity_threshold_z != 0.0 {
             let original_dtype = gate.dtype();
             let gate_f32 = gate.to_dtype(DType::F32)?;
             let mean = gate_f32.mean_keepdim(D::Minus1)?;
+            mlp_check!(mean, "sparsity/mean");
             let var = gate_f32.broadcast_sub(&mean)?.sqr()?.mean_keepdim(D::Minus1)?;
+            mlp_check!(var, "sparsity/var");
             let std = var.sqrt()?;
+            mlp_check!(std, "sparsity/std");
             let threshold = (mean + (std * self.sparsity_threshold_z)?)?;
             let sparse = gate_f32.broadcast_sub(&threshold)?;
             let zero = Tensor::zeros_like(&sparse)?;
             let sparse = sparse.maximum(&zero)?;
             gate = sparse.to_dtype(original_dtype)?;
+            mlp_check!(gate, "sparsity/gated");
         }
         let lhs = gate.apply(&self.act_fn)?;
+        mlp_check!(lhs, "act_fn(gate)");
         let up = self.up_proj.forward(xs)?;
-        self.down_proj.forward(&(lhs * up)?)
+        mlp_check!(up, "up_proj");
+        let mul = (lhs * up)?;
+        mlp_check!(mul, "lhs*up");
+        let result = self.down_proj.forward(&mul)?;
+        mlp_check!(result, "down_proj");
+        Ok(result)
     }
 }
 
@@ -752,8 +775,21 @@ impl DecoderLayer {
             );
         }
         // ── Classic / Gemma 4 path (no AltUp wiring) ────────────────────
+        let nan_diag = std::env::var("CANDLE_NAN_DIAG").is_ok();
+        macro_rules! check_nan {
+            ($t:expr, $label:expr) => {
+                if nan_diag {
+                    let chk = $t.flatten_all()?.to_dtype(candle::DType::F32)?;
+                    let v: Vec<f32> = chk.to_vec1()?;
+                    let nan_n = v.iter().filter(|v| !v.is_finite()).count();
+                    eprintln!("[nan-diag] {}: non-finite={}/{}", $label, nan_n, v.len());
+                }
+            };
+        }
         let residual = xs;
+        check_nan!(xs, "L:input");
         let normed_input = self.input_layernorm.forward(xs)?;
+        check_nan!(normed_input, "L:input_layernorm");
         let attn = self.self_attn.forward(
             &normed_input,
             attention_mask,
@@ -761,7 +797,9 @@ impl DecoderLayer {
             seqlen_offset,
             shared_kv_store,
         )?;
+        check_nan!(attn, "L:self_attn");
         let attn = self.post_attention_layernorm.forward(&attn)?;
+        check_nan!(attn, "L:post_attention_layernorm");
         // LaurelBlock merges with the attention output before the
         // first residual add: `attn = (attn + laurel(normed_input)) * inv_sqrt_2`.
         let attn = if let Some(laurel) = &self.laurel {
@@ -771,12 +809,17 @@ impl DecoderLayer {
             attn
         };
         let xs = (attn + residual)?;
+        check_nan!(xs, "L:attn+residual");
 
         let residual = &xs;
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
+        check_nan!(normed, "L:pre_ff_norm");
         let mlp_out = self.mlp.forward(&normed)?;
+        check_nan!(mlp_out, "L:mlp");
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
+        check_nan!(mlp_out, "L:post_ff_norm");
         let xs = (residual + mlp_out)?;
+        check_nan!(xs, "L:final");
 
         // PLE side-channel — gate(h) → act → * per_layer_input → proj
         // → norm → +residual. All four components must be present.
@@ -1443,6 +1486,13 @@ impl ModelWeights {
                 }
             }
             let mut stack = Tensor::stack(&streams, 0)?.contiguous()?;
+            let nan_diag = std::env::var("CANDLE_NAN_DIAG").is_ok();
+            if nan_diag {
+                let pre_check = stack.flatten_all()?.to_dtype(candle::DType::F32)?;
+                let pre_v: Vec<f32> = pre_check.to_vec1()?;
+                let pre_nan = pre_v.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("[nan-diag] pre-layer-loop: stack non-finite={pre_nan}/{}", pre_v.len());
+            }
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
@@ -1456,6 +1506,18 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
+                if nan_diag {
+                    let chk = stack.flatten_all()?.to_dtype(candle::DType::F32)?;
+                    let v: Vec<f32> = chk.to_vec1()?;
+                    let nan_n = v.iter().filter(|v| !v.is_finite()).count();
+                    if nan_n > 0 {
+                        eprintln!(
+                            "[nan-diag] layer {layer_idx}: non-finite={nan_n}/{} (FIRST NAN-BEARING LAYER)",
+                            v.len()
+                        );
+                        return Err(candle::Error::msg("nan-diag: stop on first NaN layer"));
+                    }
+                }
             }
             wasm_trace!("altup layer loop done ({} layers)", self.layers.len());
             // Unproject: `out = active + sum(unembed_projections[i](stack[i]))`
@@ -1477,6 +1539,13 @@ impl ModelWeights {
             wasm_trace!("altup unembed done, final norm");
             self.norm.forward(&acc)?
         } else {
+            let nan_diag = std::env::var("CANDLE_NAN_DIAG").is_ok();
+            if nan_diag {
+                let pre = hidden.flatten_all()?.to_dtype(candle::DType::F32)?;
+                let pv: Vec<f32> = pre.to_vec1()?;
+                let pn = pv.iter().filter(|v| !v.is_finite()).count();
+                eprintln!("[nan-diag] pre-layer-loop: hidden non-finite={pn}/{}", pv.len());
+            }
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
@@ -1490,6 +1559,18 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
+                if nan_diag {
+                    let chk = hidden.flatten_all()?.to_dtype(candle::DType::F32)?;
+                    let v: Vec<f32> = chk.to_vec1()?;
+                    let nan_n = v.iter().filter(|v| !v.is_finite()).count();
+                    if nan_n > 0 {
+                        eprintln!(
+                            "[nan-diag] layer {layer_idx}: non-finite={nan_n}/{} (FIRST NAN-BEARING LAYER)",
+                            v.len()
+                        );
+                        return Err(candle::Error::msg("nan-diag: stop on first NaN layer"));
+                    }
+                }
             }
             wasm_trace!("layer loop done ({} layers)", self.layers.len());
             self.norm.forward(&hidden)?

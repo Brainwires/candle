@@ -38,67 +38,36 @@ fn softmax(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let start_index = output_index * op_softmax_length;
     let start_index1 = start_index + op_softmax_input1_offset;
 
-    //We split the Reduction into 64 threads -> find the sub region we need to reduce over
-    var maxVal = MINVALUE;
-    if(output_index < op_softmax_dest_size || !USE_Z)
-    {
-        //Now Reduce from start to end
-        for (var i = tid; i < op_softmax_length; i += 64u) {
-            maxVal = max(maxVal, v_input1[start_index1 + i]);
-        }
-    }
-    sharedSums[tid] = maxVal;
-    workgroupBarrier();
-
-    //calculate max
-    if (tid < 32u) {
-        sharedSums[tid] = max(sharedSums[tid], sharedSums[tid + 32u]);
-    }
-    workgroupBarrier();
-    if (tid == 0) {
-        var global_max = sharedSums[0];
-        for (var i = 1u; i < 32u; i++) {
-            global_max = max(global_max, sharedSums[i]);
-        }
-        sharedSums[0] = global_max;
+    if (!(output_index < op_softmax_dest_size || !USE_Z)) {
+        return;
     }
 
-    workgroupBarrier();
+    // Single-threaded reference implementation. The previous parallel
+    // reduction (64 threads, sharedSums-based) produced wrong results
+    // on Apple Metal / AMD Radeon Pro 555 for inputs where the max is
+    // not at position 0 — root cause not nailed down (zero_initialize
+    // for workgroup memory is on, override consts are correctly
+    // applied per debug instrumentation). Until the parallel reducer
+    // is rewritten with a known-correct shape (e.g. subgroup
+    // reductions), serialise on tid=0 — softmax-last-dim is bound by
+    // memory bandwidth at this scale, so the perf hit is small while
+    // it lets the model produce non-NaN logits.
+    if (tid != 0u) {
+        return;
+    }
 
-    let maxElement = sharedSums[0];
+    var maxVal = v_input1[start_index1];
+    for (var i = 1u; i < op_softmax_length; i++) {
+        maxVal = max(maxVal, v_input1[start_index1 + i]);
+    }
 
     var sum = ZERO;
-    if (output_index < op_softmax_dest_size || !USE_Z) {
-        for (var i = tid; i < op_softmax_length; i += 64u) {
-            let val = exp(v_input1[start_index1 + i] - maxElement);
-            v_dest[start_index + i] = val;
-            sum += val;
-        }
-    }
-    sharedSums[tid] = sum;
-
-    workgroupBarrier();
-
-    // Parallel reduction to sum the exponentials
-    if (tid < 32u) {
-        sharedSums[tid] += sharedSums[tid + 32u];
-    }
-    workgroupBarrier();
-    if (tid == 0) {
-        var global_sum = sharedSums[0];
-        for (var i = 1u; i < 32u; i++) {
-            global_sum += sharedSums[i];
-        }
-        sharedSums[0] = global_sum;
+    for (var i = 0u; i < op_softmax_length; i++) {
+        sum += exp(v_input1[start_index1 + i] - maxVal);
     }
 
-    workgroupBarrier();
-
-    let totalSum = sharedSums[0];
-    if (output_index < op_softmax_dest_size || !USE_Z) {
-        for (var i = tid; i < op_softmax_length; i += 64u) {
-            v_dest[start_index + i] /= totalSum;
-        }
+    for (var i = 0u; i < op_softmax_length; i++) {
+        v_dest[start_index + i] = exp(v_input1[start_index1 + i] - maxVal) / sum;
     }
 }
 
