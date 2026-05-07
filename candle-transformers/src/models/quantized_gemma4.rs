@@ -396,17 +396,21 @@ impl Attention {
         seqlen_offset: usize,
         shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
+        let li = self.layer_idx;
         let (b_sz, q_len, _) = xs.dims3()?;
+        wasm_trace!("L{li}.attn enter is_sliding={} donor={:?}", self.is_sliding, self.donor_layer_idx);
 
         // Q is always projected from the layer's own input — receivers
         // share K/V with their donor but keep their own Q. RmsNorm
         // requires contiguous input; the reshape+transpose may yield a
         // non-contiguous tensor (q_len > 1 prefill case).
+        wasm_trace!("L{li}.attn q_proj");
         let q = self.q_proj.forward(xs)?;
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
+        wasm_trace!("L{li}.attn q_norm");
         let q = self.q_norm.forward(&q)?;
 
         // Q's RoPE comes from THIS layer's RoPE table either way. For
@@ -446,6 +450,7 @@ impl Attention {
             let k_norm = self.k_norm.as_ref().ok_or_else(|| candle::Error::Msg(
                 "quantized_gemma4: donor layer is missing its k_norm".into(),
             ))?;
+            wasm_trace!("L{li}.attn donor: k_proj+v_proj");
             let k = k_proj.forward(xs)?;
             let v = v_proj.forward(xs)?;
             let k = k
@@ -456,9 +461,12 @@ impl Attention {
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?
                 .contiguous()?;
+            wasm_trace!("L{li}.attn donor: k_norm");
             let k = k_norm.forward(&k)?;
+            wasm_trace!("L{li}.attn donor: v_norm");
             let v = v_norm(&v, self.rms_norm_eps)?;
             // q and k must share the rotated dimension; co-rotate.
+            wasm_trace!("L{li}.attn donor: rotary_emb_qkv");
             let (q_rot, k_rot) = if self.is_sliding {
                 self.rotary_emb_local
                     .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
@@ -468,6 +476,7 @@ impl Attention {
             };
             let v = v.contiguous()?;
             let k = k_rot.contiguous()?;
+            wasm_trace!("L{li}.attn donor: kv_cache.append");
             let (k_full, v_full) = match &mut self.kv_cache {
                 KvCache::Normal(c) => c.append(&k, &v)?,
                 KvCache::Rotating(c) => c.append(&k, &v)?,
@@ -476,6 +485,7 @@ impl Attention {
             (q_rot, k_full, v_full)
         };
 
+        wasm_trace!("L{li}.attn repeat_kv");
         let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
         let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
 
@@ -489,22 +499,29 @@ impl Attention {
         // prefill (q_len > 1) we keep the standard 3-step path — the
         // fused kernel is decode-only.
         let attn_output = if q_len == 1 {
+            wasm_trace!("L{li}.attn flash_attn_decode");
             candle_nn::flash_attn::flash_attn_decode(&q, &k, &v, self.sliding_window)?
         } else {
+            wasm_trace!("L{li}.attn qk_matmul");
             let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
             let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
             let attn_weights = match mask {
                 Some(m) => attn_weights.broadcast_add(m)?,
                 None => attn_weights,
             };
+            wasm_trace!("L{li}.attn softmax");
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+            wasm_trace!("L{li}.attn av_matmul");
             attn_weights.matmul(&v)?
         };
 
+        wasm_trace!("L{li}.attn o_proj");
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&attn_output)
+        let result = self.o_proj.forward(&attn_output);
+        wasm_trace!("L{li}.attn exit");
+        result
     }
 
     fn clear_kv_cache(&mut self) {
@@ -705,7 +722,9 @@ impl DecoderLayer {
         shared_kv_store: &mut SharedKvStore,
         per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
+        let li = self.self_attn.layer_idx;
         if self.altup.is_some() {
+            wasm_trace!("L{li} → forward_altup");
             return self.forward_altup(
                 xs,
                 attention_mask,
@@ -716,8 +735,10 @@ impl DecoderLayer {
             );
         }
         // ── Classic / Gemma 4 path (no AltUp wiring) ────────────────────
+        wasm_trace!("L{li} input_layernorm");
         let residual = xs;
         let normed_input = self.input_layernorm.forward(xs)?;
+        wasm_trace!("L{li} self_attn.forward");
         let attn = self.self_attn.forward(
             &normed_input,
             attention_mask,
@@ -725,22 +746,29 @@ impl DecoderLayer {
             seqlen_offset,
             shared_kv_store,
         )?;
+        wasm_trace!("L{li} post_attention_layernorm");
         let attn = self.post_attention_layernorm.forward(&attn)?;
         // LaurelBlock merges with the attention output before the
         // first residual add: `attn = (attn + laurel(normed_input)) * inv_sqrt_2`.
         let attn = if let Some(laurel) = &self.laurel {
+            wasm_trace!("L{li} laurel");
             let l = laurel.forward(&normed_input)?;
             ((attn + l)? * self.inv_sqrt_2)?
         } else {
             attn
         };
         let xs = (attn + residual)?;
+        wasm_trace!("L{li} attn+residual");
 
         let residual = &xs;
+        wasm_trace!("L{li} pre_ff_norm");
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
+        wasm_trace!("L{li} mlp.forward");
         let mlp_out = self.mlp.forward(&normed)?;
+        wasm_trace!("L{li} post_ff_norm");
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
         let xs = (residual + mlp_out)?;
+        wasm_trace!("L{li} mlp+residual");
 
         // PLE side-channel — gate(h) → act → * per_layer_input → proj
         // → norm → +residual. All four components must be present.
@@ -750,6 +778,7 @@ impl DecoderLayer {
             self.post_per_layer_input_norm.as_ref(),
             per_layer_input,
         ) {
+            wasm_trace!("L{li} ple side-channel");
             let r = xs.clone();
             let g = gate.forward(&xs)?;
             let g = g.apply(&self.per_layer_act)?;
@@ -764,11 +793,14 @@ impl DecoderLayer {
         // Per-layer learned gain (Gemma 4 specifically — initialised to
         // 1.0 and trained per layer). Without this multiply the
         // residual stream `abs_max` runs away on E2B.
-        if let Some(scalar) = &self.layer_scalar {
+        let result = if let Some(scalar) = &self.layer_scalar {
+            wasm_trace!("L{li} layer_scalar");
             xs.broadcast_mul(scalar)
         } else {
             Ok(xs)
-        }
+        };
+        wasm_trace!("L{li} forward exit");
+        result
     }
 
     /// AltUp forward — `xs` is `[num_inputs, B, T, hidden]`, returns
