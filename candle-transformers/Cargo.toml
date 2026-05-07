@@ -25,6 +25,9 @@ serde_json = { workspace = true }
 serde_plain = { workspace = true }
 tracing = { workspace = true }
 
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["console"], optional = true }
+
 [features]
 default = []
 accelerate = ["dep:accelerate-src", "candle/accelerate", "candle-nn/accelerate"]
@@ -34,3 +37,8 @@ flash-attn = ["cuda", "dep:candle-flash-attn"]
 mkl = ["dep:intel-mkl-src", "candle/mkl", "candle-nn/mkl"]
 metal = ["candle/metal", "candle-nn/metal"]
 wgpu = ["candle/wgpu"]
+# Detailed step-by-step `console.log` traces inside
+# `quantized_gemma4::ModelWeights::forward` for browser debugging
+# of wasm traps. Off by default — only wired by the chat-pwa wasm
+# crate.
+wasm-trace-quantized-gemma4 = ["dep:web-sys"]

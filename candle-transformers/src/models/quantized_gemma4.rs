@@ -54,6 +54,25 @@ use candle::quantized::{gguf_file, QMatMul, QTensor};
 use candle::{CpuStorage, DType, Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::Activation;
 
+/// Diag trace inside `Model::forward` — only compiled in for the
+/// chat-pwa wasm build via `wasm-trace-quantized-gemma4`. Every call
+/// emits one line to `console.log`. Use to bisect wasm traps that
+/// fire mid-forward without a Rust panic stack (e.g. rayon thread-init
+/// `unreachable`, OOM, simd128 fallthrough panics).
+#[cfg(all(target_arch = "wasm32", feature = "wasm-trace-quantized-gemma4"))]
+macro_rules! wasm_trace {
+    ($($t:tt)*) => {{
+        web_sys::console::log_1(&format!("[qgemma4/trace] {}", format!($($t)*)).into());
+    }};
+}
+#[cfg(not(all(target_arch = "wasm32", feature = "wasm-trace-quantized-gemma4")))]
+macro_rules! wasm_trace {
+    ($($t:tt)*) => {{
+        // no-op on native and on wasm without the trace feature
+        let _ = format_args!($($t)*);
+    }};
+}
+
 /// Row-wise embedding lookup against a quantized table — equivalent to
 /// `ggml_get_rows(qtensor, ids)` in llama.cpp. Holds the QTensor as-is
 /// and dequantizes only the rows referenced by each forward call.
@@ -1288,26 +1307,32 @@ impl ModelWeights {
     /// `[b, q_len, vocab_size]` logits.
     pub fn forward(&mut self, xs: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_sz, q_len) = xs.dims2()?;
+        wasm_trace!("forward enter b={b_sz} q_len={q_len} seqlen_offset={seqlen_offset}");
         // QEmbedding does the row-wise dequant on CPU and returns the
         // (small) result on `xs.device()`. Move to `self.device` so
         // every downstream op sees a same-device tensor.
+        wasm_trace!("embed_tokens.forward (QEmbedding row-wise dequant)");
         let inputs_embeds = self.embed_tokens.forward(xs)?;
         let inputs_embeds = if inputs_embeds.device().same_device(&self.device) {
             inputs_embeds
         } else {
             inputs_embeds.to_device(&self.device)?
         };
+        wasm_trace!("inputs_embeds ready dtype={:?}", inputs_embeds.dtype());
         // Gemma scale: input embeddings are multiplied by sqrt(hidden_size).
         let mut hidden = (inputs_embeds.clone() * self.embed_scale)?;
+        wasm_trace!("embed_scale done");
 
         let attention_mask = if q_len <= 1 {
             None
         } else {
+            wasm_trace!("prepare_attention_mask");
             Some(prepare_attention_mask(b_sz, q_len, seqlen_offset, &self.device, hidden.dtype())?)
         };
         let sliding_attention_mask = if q_len <= 1 {
             None
         } else {
+            wasm_trace!("prepare_sliding_attention_mask");
             Some(prepare_sliding_attention_mask(
                 b_sz,
                 q_len,
@@ -1322,9 +1347,16 @@ impl ModelWeights {
         // hidden_per_layer]` table once per step and slice per layer
         // inside the loop.
         let per_layer_table = match &self.per_layer_embedding {
-            Some(ple) => Some(ple.forward(xs, &inputs_embeds)?),
-            None => None,
+            Some(ple) => {
+                wasm_trace!("per_layer_embedding.forward");
+                Some(ple.forward(xs, &inputs_embeds)?)
+            }
+            None => {
+                wasm_trace!("per_layer_embedding: None");
+                None
+            }
         };
+        wasm_trace!("per_layer_table done");
 
         // Per-step shared K/V store for KV-shared receivers. Keyed by
         // donor layer index — donors write here after their cache
@@ -1336,6 +1368,7 @@ impl ModelWeights {
         let altup_active = self.altup_projections.is_some()
             && self.altup_unembed_projections.is_some()
             && self.altup_num_inputs > 1;
+        wasm_trace!("altup_active={altup_active} num_layers={}", self.layers.len());
 
         let hidden = if altup_active {
             // Project the original hidden into a stack of altup_num_inputs
@@ -1352,7 +1385,9 @@ impl ModelWeights {
                 }
             }
             let mut stack = Tensor::stack(&streams, 0)?.contiguous()?;
+            wasm_trace!("altup stack built, entering layer loop");
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                wasm_trace!("altup layer {layer_idx} enter");
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
                     None => None,
@@ -1365,6 +1400,7 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
+                wasm_trace!("altup layer {layer_idx} done");
             }
             // Unproject: `out = active + sum(unembed_projections[i](stack[i]))`
             // for i != active_idx. The trained model treats the active
@@ -1382,9 +1418,12 @@ impl ModelWeights {
                 let unembedded = unembeds[idx].forward(&stream)?;
                 acc = (acc + unembedded)?;
             }
+            wasm_trace!("altup unembed done, final norm");
             self.norm.forward(&acc)?
         } else {
+            wasm_trace!("classic single-stream layer loop");
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                wasm_trace!("layer {layer_idx} enter");
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
                     None => None,
@@ -1397,22 +1436,30 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
+                wasm_trace!("layer {layer_idx} done");
             }
+            wasm_trace!("final norm");
             self.norm.forward(&hidden)?
         };
         // Take the last token only for autoregressive sampling — same as
         // gemma4/text.rs.
+        wasm_trace!("slice last token");
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
+        wasm_trace!("lm_head.forward");
         let logits = self.lm_head.forward(&hidden)?;
+        wasm_trace!("lm_head done");
         // Final-logit softcap: tanh(logits / softcap) * softcap.
-        match self.cfg.final_logit_softcapping {
+        let result = match self.cfg.final_logit_softcapping {
             Some(sc) if sc > 0.0 => {
+                wasm_trace!("logit softcap (sc={sc})");
                 let scaled = (logits / sc)?;
                 let capped = scaled.tanh()?;
                 capped * sc
             }
             _ => Ok(logits),
-        }
+        };
+        wasm_trace!("forward exit");
+        result
     }
 
     pub fn clear_kv_cache(&mut self) {
