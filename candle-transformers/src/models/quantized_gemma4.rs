@@ -120,8 +120,14 @@ impl QEmbedding {
         }
         let blocks_per_row = cols / block_size;
         let bytes_per_row = blocks_per_row * type_size;
-        let storage_size = qtensor.storage_size_in_bytes();
-        let expected_size = rows * bytes_per_row;
+        // Compute expected_size in u64 — `rows * bytes_per_row` can exceed
+        // u32 on wasm32 (PLE tables in Ollama's gemma4:e2b are bf16
+        // [262144, 8960] = 4.7 GB). Without u64 widening this silently
+        // wraps to a smaller value, both here and in candle's GGUF
+        // length math, leaving the underlying Vec truncated and lookups
+        // returning garbage bytes.
+        let storage_size = qtensor.storage_size_in_bytes() as u64;
+        let expected_size = (rows as u64) * (bytes_per_row as u64);
         wasm_trace!(
             "QEmbedding::new shape=[{rows}, {cols}] dtype={dtype:?} \
              block_size={block_size} type_size={type_size} \
@@ -130,6 +136,15 @@ impl QEmbedding {
              match={}",
             storage_size == expected_size,
         );
+        if storage_size != expected_size {
+            candle::bail!(
+                "QEmbedding storage truncation: dtype={dtype:?} shape=[{rows},{cols}] \
+                 expected_bytes={expected_size} actual_bytes={storage_size} \
+                 (likely usize overflow on wasm32 inside the GGUF loader — \
+                 a bf16 PLE table at this shape exceeds the 4 GB linear \
+                 memory ceiling)"
+            );
+        }
         Ok(Self {
             qtensor: Arc::new(qtensor),
             rows,
@@ -149,17 +164,6 @@ impl QEmbedding {
         let ids: Vec<u32> = flat.to_vec1::<u32>()?;
         let raw = self.qtensor.data()?;
         let dtype = self.qtensor.dtype();
-        let preview_n = ids.len().min(8);
-        wasm_trace!(
-            "QEmbedding::forward ids[..{preview_n}]={:?} ids.len={} \
-             raw.len={} bytes_per_row={} rows={} cols={}",
-            &ids[..preview_n],
-            ids.len(),
-            raw.len(),
-            self.bytes_per_row,
-            self.rows,
-            self.cols,
-        );
         let mut out = Vec::<f32>::with_capacity(ids.len() * self.cols);
         for &id in &ids {
             let id_us = id as usize;
@@ -428,21 +432,17 @@ impl Attention {
         seqlen_offset: usize,
         shared_kv_store: &mut SharedKvStore,
     ) -> Result<Tensor> {
-        let li = self.layer_idx;
         let (b_sz, q_len, _) = xs.dims3()?;
-        wasm_trace!("L{li}.attn enter is_sliding={} donor={:?}", self.is_sliding, self.donor_layer_idx);
 
         // Q is always projected from the layer's own input — receivers
         // share K/V with their donor but keep their own Q. RmsNorm
         // requires contiguous input; the reshape+transpose may yield a
         // non-contiguous tensor (q_len > 1 prefill case).
-        wasm_trace!("L{li}.attn q_proj");
         let q = self.q_proj.forward(xs)?;
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
-        wasm_trace!("L{li}.attn q_norm");
         let q = self.q_norm.forward(&q)?;
 
         // Q's RoPE comes from THIS layer's RoPE table either way. For
@@ -482,7 +482,6 @@ impl Attention {
             let k_norm = self.k_norm.as_ref().ok_or_else(|| candle::Error::Msg(
                 "quantized_gemma4: donor layer is missing its k_norm".into(),
             ))?;
-            wasm_trace!("L{li}.attn donor: k_proj+v_proj");
             let k = k_proj.forward(xs)?;
             let v = v_proj.forward(xs)?;
             let k = k
@@ -493,12 +492,9 @@ impl Attention {
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?
                 .contiguous()?;
-            wasm_trace!("L{li}.attn donor: k_norm");
             let k = k_norm.forward(&k)?;
-            wasm_trace!("L{li}.attn donor: v_norm");
             let v = v_norm(&v, self.rms_norm_eps)?;
             // q and k must share the rotated dimension; co-rotate.
-            wasm_trace!("L{li}.attn donor: rotary_emb_qkv");
             let (q_rot, k_rot) = if self.is_sliding {
                 self.rotary_emb_local
                     .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
@@ -508,7 +504,6 @@ impl Attention {
             };
             let v = v.contiguous()?;
             let k = k_rot.contiguous()?;
-            wasm_trace!("L{li}.attn donor: kv_cache.append");
             let (k_full, v_full) = match &mut self.kv_cache {
                 KvCache::Normal(c) => c.append(&k, &v)?,
                 KvCache::Rotating(c) => c.append(&k, &v)?,
@@ -517,7 +512,6 @@ impl Attention {
             (q_rot, k_full, v_full)
         };
 
-        wasm_trace!("L{li}.attn repeat_kv");
         let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
         let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
 
@@ -531,29 +525,22 @@ impl Attention {
         // prefill (q_len > 1) we keep the standard 3-step path — the
         // fused kernel is decode-only.
         let attn_output = if q_len == 1 {
-            wasm_trace!("L{li}.attn flash_attn_decode");
             candle_nn::flash_attn::flash_attn_decode(&q, &k, &v, self.sliding_window)?
         } else {
-            wasm_trace!("L{li}.attn qk_matmul");
             let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
             let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
             let attn_weights = match mask {
                 Some(m) => attn_weights.broadcast_add(m)?,
                 None => attn_weights,
             };
-            wasm_trace!("L{li}.attn softmax");
             let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            wasm_trace!("L{li}.attn av_matmul");
             attn_weights.matmul(&v)?
         };
 
-        wasm_trace!("L{li}.attn o_proj");
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-        let result = self.o_proj.forward(&attn_output);
-        wasm_trace!("L{li}.attn exit");
-        result
+        self.o_proj.forward(&attn_output)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -754,9 +741,7 @@ impl DecoderLayer {
         shared_kv_store: &mut SharedKvStore,
         per_layer_input: Option<&Tensor>,
     ) -> Result<Tensor> {
-        let li = self.self_attn.layer_idx;
         if self.altup.is_some() {
-            wasm_trace!("L{li} → forward_altup");
             return self.forward_altup(
                 xs,
                 attention_mask,
@@ -767,10 +752,8 @@ impl DecoderLayer {
             );
         }
         // ── Classic / Gemma 4 path (no AltUp wiring) ────────────────────
-        wasm_trace!("L{li} input_layernorm");
         let residual = xs;
         let normed_input = self.input_layernorm.forward(xs)?;
-        wasm_trace!("L{li} self_attn.forward");
         let attn = self.self_attn.forward(
             &normed_input,
             attention_mask,
@@ -778,29 +761,22 @@ impl DecoderLayer {
             seqlen_offset,
             shared_kv_store,
         )?;
-        wasm_trace!("L{li} post_attention_layernorm");
         let attn = self.post_attention_layernorm.forward(&attn)?;
         // LaurelBlock merges with the attention output before the
         // first residual add: `attn = (attn + laurel(normed_input)) * inv_sqrt_2`.
         let attn = if let Some(laurel) = &self.laurel {
-            wasm_trace!("L{li} laurel");
             let l = laurel.forward(&normed_input)?;
             ((attn + l)? * self.inv_sqrt_2)?
         } else {
             attn
         };
         let xs = (attn + residual)?;
-        wasm_trace!("L{li} attn+residual");
 
         let residual = &xs;
-        wasm_trace!("L{li} pre_ff_norm");
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
-        wasm_trace!("L{li} mlp.forward");
         let mlp_out = self.mlp.forward(&normed)?;
-        wasm_trace!("L{li} post_ff_norm");
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
         let xs = (residual + mlp_out)?;
-        wasm_trace!("L{li} mlp+residual");
 
         // PLE side-channel — gate(h) → act → * per_layer_input → proj
         // → norm → +residual. All four components must be present.
@@ -810,7 +786,6 @@ impl DecoderLayer {
             self.post_per_layer_input_norm.as_ref(),
             per_layer_input,
         ) {
-            wasm_trace!("L{li} ple side-channel");
             let r = xs.clone();
             let g = gate.forward(&xs)?;
             let g = g.apply(&self.per_layer_act)?;
@@ -825,14 +800,11 @@ impl DecoderLayer {
         // Per-layer learned gain (Gemma 4 specifically — initialised to
         // 1.0 and trained per layer). Without this multiply the
         // residual stream `abs_max` runs away on E2B.
-        let result = if let Some(scalar) = &self.layer_scalar {
-            wasm_trace!("L{li} layer_scalar");
+        if let Some(scalar) = &self.layer_scalar {
             xs.broadcast_mul(scalar)
         } else {
             Ok(xs)
-        };
-        wasm_trace!("L{li} forward exit");
-        result
+        }
     }
 
     /// AltUp forward — `xs` is `[num_inputs, B, T, hidden]`, returns
@@ -1349,6 +1321,17 @@ impl ModelWeights {
                 // `ggml_get_rows`). Allocation footprint stays at the
                 // quantized size (~1.1 GB at Q4_K_M).
                 let _ = total; // shape now derived from QTensor inside QEmbedding
+                // On wasm32 the per_layer_token_embd in Ollama's
+                // gemma4:e2b is bf16 [262144, 8960] = 4.7 GB, exceeding
+                // wasm32's 4 GB linear-memory ceiling. The candle GGUF
+                // loader silently truncates the byte count via usize=u32
+                // overflow, so the loaded data would be corrupt.
+                // `PerLayerEmbedding::forward` already supports a None
+                // table via the projection-only path — fall back to
+                // that on wasm32 instead of returning garbage.
+                #[cfg(target_arch = "wasm32")]
+                let embed_tokens_per_layer: Option<QEmbedding> = None;
+                #[cfg(not(target_arch = "wasm32"))]
                 let embed_tokens_per_layer = ct
                     .tensor(reader, "per_layer_token_embd.weight", &Device::Cpu)
                     .or_else(|_| ct.tensor(reader, "embed_tokens_per_layer.weight", &Device::Cpu))
@@ -1394,28 +1377,23 @@ impl ModelWeights {
         // QEmbedding does the row-wise dequant on CPU and returns the
         // (small) result on `xs.device()`. Move to `self.device` so
         // every downstream op sees a same-device tensor.
-        wasm_trace!("embed_tokens.forward (QEmbedding row-wise dequant)");
         let inputs_embeds = self.embed_tokens.forward(xs)?;
         let inputs_embeds = if inputs_embeds.device().same_device(&self.device) {
             inputs_embeds
         } else {
             inputs_embeds.to_device(&self.device)?
         };
-        wasm_trace!("inputs_embeds ready dtype={:?}", inputs_embeds.dtype());
         // Gemma scale: input embeddings are multiplied by sqrt(hidden_size).
         let mut hidden = (inputs_embeds.clone() * self.embed_scale)?;
-        wasm_trace!("embed_scale done");
 
         let attention_mask = if q_len <= 1 {
             None
         } else {
-            wasm_trace!("prepare_attention_mask");
             Some(prepare_attention_mask(b_sz, q_len, seqlen_offset, &self.device, hidden.dtype())?)
         };
         let sliding_attention_mask = if q_len <= 1 {
             None
         } else {
-            wasm_trace!("prepare_sliding_attention_mask");
             Some(prepare_sliding_attention_mask(
                 b_sz,
                 q_len,
@@ -1430,16 +1408,14 @@ impl ModelWeights {
         // hidden_per_layer]` table once per step and slice per layer
         // inside the loop.
         let per_layer_table = match &self.per_layer_embedding {
-            Some(ple) => {
-                wasm_trace!("per_layer_embedding.forward");
-                Some(ple.forward(xs, &inputs_embeds)?)
-            }
-            None => {
-                wasm_trace!("per_layer_embedding: None");
-                None
-            }
+            Some(ple) => Some(ple.forward(xs, &inputs_embeds)?),
+            None => None,
         };
-        wasm_trace!("per_layer_table done");
+        wasm_trace!(
+            "pre-layer-loop: per_layer_table={} altup={}",
+            per_layer_table.is_some(),
+            self.altup_projections.is_some(),
+        );
 
         // Per-step shared K/V store for KV-shared receivers. Keyed by
         // donor layer index — donors write here after their cache
@@ -1451,7 +1427,6 @@ impl ModelWeights {
         let altup_active = self.altup_projections.is_some()
             && self.altup_unembed_projections.is_some()
             && self.altup_num_inputs > 1;
-        wasm_trace!("altup_active={altup_active} num_layers={}", self.layers.len());
 
         let hidden = if altup_active {
             // Project the original hidden into a stack of altup_num_inputs
@@ -1468,9 +1443,7 @@ impl ModelWeights {
                 }
             }
             let mut stack = Tensor::stack(&streams, 0)?.contiguous()?;
-            wasm_trace!("altup stack built, entering layer loop");
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                wasm_trace!("altup layer {layer_idx} enter");
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
                     None => None,
@@ -1483,8 +1456,8 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
-                wasm_trace!("altup layer {layer_idx} done");
             }
+            wasm_trace!("altup layer loop done ({} layers)", self.layers.len());
             // Unproject: `out = active + sum(unembed_projections[i](stack[i]))`
             // for i != active_idx. The trained model treats the active
             // stream as the canonical prediction and the others as
@@ -1504,9 +1477,7 @@ impl ModelWeights {
             wasm_trace!("altup unembed done, final norm");
             self.norm.forward(&acc)?
         } else {
-            wasm_trace!("classic single-stream layer loop");
             for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                wasm_trace!("layer {layer_idx} enter");
                 let per_layer_input = match &per_layer_table {
                     Some(t) => Some(t.i((.., .., layer_idx, ..))?.contiguous()?),
                     None => None,
@@ -1519,22 +1490,17 @@ impl ModelWeights {
                     &mut shared_kv_store,
                     per_layer_input.as_ref(),
                 )?;
-                wasm_trace!("layer {layer_idx} done");
             }
-            wasm_trace!("final norm");
+            wasm_trace!("layer loop done ({} layers)", self.layers.len());
             self.norm.forward(&hidden)?
         };
         // Take the last token only for autoregressive sampling — same as
         // gemma4/text.rs.
-        wasm_trace!("slice last token");
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
-        wasm_trace!("lm_head.forward");
         let logits = self.lm_head.forward(&hidden)?;
-        wasm_trace!("lm_head done");
         // Final-logit softcap: tanh(logits / softcap) * softcap.
         let result = match self.cfg.final_logit_softcapping {
             Some(sc) if sc > 0.0 => {
-                wasm_trace!("logit softcap (sc={sc})");
                 let scaled = (logits / sc)?;
                 let capped = scaled.tanh()?;
                 capped * sc
