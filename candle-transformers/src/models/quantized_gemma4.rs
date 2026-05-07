@@ -1024,7 +1024,26 @@ impl ModelWeights {
             let kv_cache = if is_sliding {
                 KvCache::Rotating(candle_nn::kv_cache::RotatingKvCache::new(2, cfg.effective_sliding_window()))
             } else {
-                KvCache::Normal(candle_nn::kv_cache::KvCache::new(2, cfg.max_position_embeddings))
+                // Full-attention layers used to pass `cfg.max_position_embeddings`
+                // (32768 for Gemma 4 E2B) directly. `KvCache::Cache::append`
+                // lazily allocates `[B, num_kv_heads, max_seq_len, head_dim]`
+                // on first call — at head_dim=512, num_kv_heads=4, that's
+                // ~536 MB per full layer. Gemma 4 E2B has 7 full layers
+                // (one every 5 layers across 35 total), so the cumulative
+                // allocation is ~3.75 GB and overflows wasm32's 4 GB
+                // address space mid-prefill (typically traps inside L14's
+                // first kv_cache.append, the 3rd full layer).
+                //
+                // Cap the *initial* capacity at `KV_CACHE_INITIAL_CAP`
+                // (still grows on demand via `Cache::append`'s
+                // grow-and-concat path). 4 KB tokens covers the vast
+                // majority of single-turn chats; longer contexts pay one
+                // realloc per `KV_CACHE_INITIAL_CAP` tokens. Native
+                // builds were also wasting memory at the old size; the
+                // cap helps everyone.
+                const KV_CACHE_INITIAL_CAP: usize = 4096;
+                let initial = cfg.max_position_embeddings.min(KV_CACHE_INITIAL_CAP);
+                KvCache::Normal(candle_nn::kv_cache::KvCache::new(2, initial))
             };
 
             let self_attn = Attention {
