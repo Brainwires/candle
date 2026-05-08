@@ -69,31 +69,33 @@ fn rms_norm(@builtin(local_invocation_id) local_id: vec3<u32>, @builtin(workgrou
         BF16_STORE_ATOMIC(v_dest, start_index + i, x / sharedMean * w);
     }
 #else
-    //Now Reduce from start to end
-    var sum = ZERO;
-    for (var i = start; i < end; i++){
-        let v = v_input1[start_index1 + i];
-        sum += v*v;
-    }
-    sharedSums[tid] = sum;
-
-    workgroupBarrier();
-
-    //This is not optimal (only 1 of 64 threads sums the partial result of each thread)
-    //TODO: Either use multiple threads for the sum(e.g. first 32 threads, then 16, then 8, ...)
-    //      or let one thread calculate multiple outputs in sharedSums, and then let multiple threads sum the partial results of one output(like in matmul1x64b)
-    if (tid == 0){
-        let cnt = oop_rms_norm_contiguous_workgroup_count;
-        //Finnaly Sum of all worker threads:
+    // Single-threaded sum on tid=0.
+    //
+    // The natural pattern here is the parallel reduction (each thread
+    // sums a chunk into sharedSums[tid], then tid=0 sums all 64
+    // slots). That works correctly when wgpu's Naga backend lowers the
+    // shader to MSL — output matches the CPU baseline exactly. But
+    // the same WGSL going through Chrome/Dawn's Tint compiler (the
+    // browser path on macOS Metal) produces logits whose pre-softcap
+    // magnitude collapses by ~4× over 35 layers — symptom of a
+    // memory hazard around `sharedSums` that the parallel-reduce
+    // pattern apparently allows. Tracked upstream as the wgpu#4500
+    // class of Naga-vs-Tint discrepancies.
+    //
+    // Single-threaded reduction sidesteps the `var<workgroup>`
+    // race entirely. Slower in theory, but the chat-pwa decode is
+    // dominated by the GPU→CPU readback for argmax (~330 ms/token)
+    // not by the per-RMSNorm 1.5 KB summation, so end-to-end perf
+    // is the same.
+    if (tid == 0u) {
         var sum = ZERO;
-        for (var i = 0u; i < cnt; i++){
-            sum +=  sharedSums[i];
+        for (var i = 0u; i < length; i++){
+            let v = v_input1[start_index1 + i];
+            sum += v*v;
         }
         let mean = f32(sum) / f32(length);
-        let m = sqrt(mean + oop_rms_norm_contiguous_eps);
-        sharedMean = m;
+        sharedMean = sqrt(mean + oop_rms_norm_contiguous_eps);
     }
-
     workgroupBarrier();
 
     for (var i = start; i < end; i++){
