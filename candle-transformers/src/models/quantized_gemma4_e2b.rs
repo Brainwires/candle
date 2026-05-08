@@ -14,10 +14,15 @@
 //! - `parseTextConfig` RoPE math → `RotaryEmbedding::new` /
 //!   `ProportionalRotaryEmbedding::new`
 //!
-//! Bug fix vs `quantized_gemma4.rs`: `layer_scalar` is applied **only
-//! to full-attention layers**, matching Ollama lines 1203-1204. The
-//! older module applied it to every layer, which compounded over the
-//! sliding stack.
+//! Note on `layer_scalar`: Ollama's Go gemma4 (lines 1203-1204) gates
+//! the residual gain on full-attention layers only. That's correct for
+//! vanilla Gemma 4, but gemma4:e2b carries layer_scalar tensors for
+//! every layer and its training expects them everywhere — skipping
+//! the multiply on sliding layers makes the residual stream's abs_max
+//! run away (verified empirically: produced mixed-script garbage
+//! logits within a 1-point band). This module applies layer_scalar to
+//! every layer that has the tensor, matching the old `quantized_gemma4`
+//! behavior.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -674,7 +679,9 @@ struct DecoderLayer {
     /// Per-layer learned scalar applied **only to full-attention layers**
     /// (Ollama lines 1203-1205). When `None`, no scaling is done.
     layer_scalar: Option<Tensor>,
-    /// True for full-attention layers; gates `layer_scalar` application.
+    /// True for full-attention layers. Used by the loader to detect
+    /// the `attention_k_eq_v` mode (full layers without v_proj reuse k
+    /// as v).
     is_full_attention: bool,
 }
 
@@ -743,15 +750,17 @@ impl DecoderLayer {
         };
         bdump!(bdir, step, layer_idx, "10_after_ple", &h);
 
-        // Block 4: layer_scalar — Ollama 1203-1205 applies it
-        // unconditionally based on tensor presence; we restrict to
-        // full-attention layers per the bug fix in the plan.
-        let out = if self.is_full_attention {
-            if let Some(scalar) = &self.layer_scalar {
-                h.broadcast_mul(scalar)?
-            } else {
-                h
-            }
+        // Block 4: layer_scalar — apply to ALL layers when present.
+        //
+        // Ollama's Go gemma4 (line 1203-1205) gates this on full-
+        // attention only. That's correct for vanilla Gemma 4, BUT
+        // gemma4:e2b carries layer_scalar tensors for every layer and
+        // its training expects them everywhere — skipping the multiply
+        // on sliding layers makes the residual stream's abs_max run
+        // away (confirmed empirically: omitting on sliding produced
+        // mixed-script garbage logits within a 1-point band).
+        let out = if let Some(scalar) = &self.layer_scalar {
+            h.broadcast_mul(scalar)?
         } else {
             h
         };
