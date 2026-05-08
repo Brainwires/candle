@@ -1,0 +1,242 @@
+// Quantize one row of f32 to BlockQ8K.
+//
+// MIRROR of CPU `BlockQ8K::from_float` in
+// candle-core/src/quantized/k_quants.rs (lines ~2214-2250):
+//
+//   for each 256-element block:
+//     amax = max(|x|);  max = signed value at the FIRST position with |x| == amax
+//     if amax == 0:  d = 0; qs all 0; bsums all 0
+//     else:          iscale = -128 / max
+//                    qs[j]  = saturating_i8(round_half_away(iscale * x[j]))
+//                    bsums[j] = sum_{i=0..16} qs[j*16+i]
+//                    d      = 1 / iscale
+//
+// Numeric subtleties (must match CPU bit-for-bit):
+//   1. Rust `f32::round` is half-away-from-zero, NOT half-to-even.
+//      WGSL's built-in `round()` is half-to-even, so we implement
+//      `round_half_away(x) = sign(x) * floor(|x| + 0.5)` ourselves.
+//   2. Rust's `as i8` cast saturates. The CPU code writes
+//      `v.min(127.) as i8` which only caps the positive side; the
+//      negative side is capped by the cast. We replicate via
+//      `clamp(round_half_away(iscale * x), -128, 127)` (clamp_i32 is
+//      identical because the input is already a quantized value).
+//   3. `max` is the SIGNED value at the abs-max position. The CPU loop
+//      uses `if amax < x.abs()` (strict less-than), so on ties the
+//      FIRST element wins. The tree reduce below preserves this by
+//      breaking ties on lower element index.
+//
+// On-disk block layout (matches `#[repr(C)] struct BlockQ8K` exactly,
+// 292 bytes total / 73 u32 words per block):
+//
+//   word 0       : f32 d
+//   words 1..65  : 256 i8 qs (packed 4 bytes per u32, little-endian)
+//   words 65..73 : 16 i16 bsums (packed 2 halves per u32, low half first)
+//
+// Bindings (set 0):
+//   binding 0  v_dest_u32   : array<u32>  (output blocks, 73 u32 per block)
+//   binding 2  v_input1     : array<f32>  (input row, k elements)
+//   binding 1  op_quantize  : 1 u32: total element count `k`
+
+#include "../util.pwgsl"
+
+#ifdef f32
+
+LOAD_INFO(op_quantize, 1)
+#define op_quantize_size               op_quantize[0]
+
+const Q8K_BLOCK_SIZE_ELEMS : u32 = 256u;
+const Q8K_BLOCK_WORDS      : u32 = 73u;
+const Q8K_QS_WORD_OFFSET   : u32 = 1u;       // word 0 is d
+const Q8K_BSUMS_WORD_OFFSET: u32 = 65u;      // 1 (d) + 64 (qs words)
+
+const TPB : u32 = 64u; // threads per workgroup
+const VPT : u32 = 4u;  // values per thread (256 / 64)
+
+// Per-lane local result for the amax reduction.
+// idx is the absolute element index (0..255) of the lane's local winner.
+struct AmaxResult {
+    amax : f32,
+    max  : f32,
+    idx  : u32,
+}
+
+var<workgroup> wg_amax       : array<f32, TPB>;
+var<workgroup> wg_max        : array<f32, TPB>;
+var<workgroup> wg_idx        : array<u32, TPB>;
+var<workgroup> wg_qs         : array<i32, 256>; // staged quants for bsums
+var<workgroup> wg_iscale     : f32;
+var<workgroup> wg_amax_final : f32;             // == 0 sentinel
+
+// Round half-away-from-zero, matching Rust's `f32::round`.
+fn round_half_away(x: f32) -> f32 {
+    return sign(x) * floor(abs(x) + 0.5);
+}
+
+// Compose 4 packed i8 (sign-bit not extended in storage; we mask to 0xFF
+// since the bit pattern is what matters for the read side).
+fn pack_i8x4(b0: i32, b1: i32, b2: i32, b3: i32) -> u32 {
+    return (u32(b0) & 0xFFu)
+         | ((u32(b1) & 0xFFu) << 8u)
+         | ((u32(b2) & 0xFFu) << 16u)
+         | ((u32(b3) & 0xFFu) << 24u);
+}
+
+// Compose 2 packed i16 (low half first), again as raw bit patterns.
+fn pack_i16x2(h0: i32, h1: i32) -> u32 {
+    return (u32(h0) & 0xFFFFu) | ((u32(h1) & 0xFFFFu) << 16u);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn quantize_row_to_q8k(
+    @builtin(workgroup_id) wg_id : vec3<u32>,
+    @builtin(local_invocation_id) lid : vec3<u32>,
+) {
+    let block_index = wg_id.x;
+    let total = op_quantize_size;
+    let n_blocks = total / Q8K_BLOCK_SIZE_ELEMS;
+    if (block_index >= n_blocks) {
+        return;
+    }
+
+    let lane = lid.x;
+    let block_input_off = block_index * Q8K_BLOCK_SIZE_ELEMS;
+    let block_word_off  = block_index * Q8K_BLOCK_WORDS;
+
+    // ---------- Phase 1: per-lane local (amax, max, idx) over 4 elems ----------
+    var local_amax : f32 = 0.0;
+    var local_max  : f32 = 0.0;
+    var local_idx  : u32 = 0u; // sentinel; only meaningful if local_amax > 0
+
+    // Match CPU iteration order: i = 0..256 ascending. Lane L scans
+    // L*VPT, L*VPT+1, L*VPT+2, L*VPT+3.
+    for (var k : u32 = 0u; k < VPT; k = k + 1u) {
+        let i = lane * VPT + k;
+        let x = v_input1[block_input_off + i];
+        let ax = abs(x);
+        // STRICT less-than: only update on a strictly larger |x|. This
+        // makes the FIRST occurrence on ties win, matching CPU.
+        if (local_amax < ax) {
+            local_amax = ax;
+            local_max  = x;
+            local_idx  = i;
+        }
+    }
+    wg_amax[lane] = local_amax;
+    wg_max[lane]  = local_max;
+    wg_idx[lane]  = local_idx;
+    workgroupBarrier();
+
+    // ---------- Phase 2: tree reduce 64 -> 1, lower idx wins on ties ----------
+    // Important tie-rule: `other.amax > self.amax` (strict). On equal
+    // amax, the one with the LOWER absolute index wins, which matches
+    // the strict-LT semantics of the CPU's first-wins iteration.
+    var stride : u32 = TPB / 2u;
+    loop {
+        if (stride == 0u) { break; }
+        if (lane < stride) {
+            let other = lane + stride;
+            let oa = wg_amax[other];
+            let oi = wg_idx[other];
+            let sa = wg_amax[lane];
+            let si = wg_idx[lane];
+            let take_other = (oa > sa) || (oa == sa && oi < si && oa > 0.0);
+            if (take_other) {
+                wg_amax[lane] = oa;
+                wg_max[lane]  = wg_max[other];
+                wg_idx[lane]  = oi;
+            }
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+
+    // Lane 0 publishes (amax, iscale) and writes `d`.
+    //
+    // Numeric note on `d`: WGSL allows up to 2.5 ULP error on f32
+    // division, while CPU `1.0 / iscale` is IEEE-correct (0.5 ULP),
+    // so on some inputs the GPU produces a `d` that differs from the
+    // CPU result by ±1 ULP. The integer fields (`qs`, `bsums`) ARE
+    // bit-identical to CPU regardless — the per-element multiply
+    // `iscale * x` rounds the same way, so `clamp(round_half_away(...))`
+    // produces the same i8. We tried Newton-Raphson refinement of
+    // `1/iscale` via fma; on Apple Metal it sometimes overshot CPU
+    // by 1 ULP in the OTHER direction, so the simple form is more
+    // accurate here.
+    //
+    // Downstream impact: a 1-ULP deviation in `d_y` flows to a 1-ULP
+    // deviation in the final f32 dot-product scale, which is well
+    // inside the 1e-5 tolerance the model exhibits at the matmul
+    // level (CPU's own `1/iscale` already has 1 ULP of accumulated
+    // round-off vs the mathematically-exact `-max/128`). We document
+    // this here and the test asserts byte-identity for qs/bsums and
+    // ≤1 ULP for d.
+    if (lane == 0u) {
+        let amax = wg_amax[0];
+        let max  = wg_max[0];
+        wg_amax_final = amax;
+        var d_val : f32 = 0.0;
+        var iscale : f32 = 0.0;
+        if (amax > 0.0) {
+            iscale = -128.0 / max;
+            d_val  = 1.0 / iscale;
+        }
+        wg_iscale = iscale;
+        v_dest_u32[block_word_off] = bitcast<u32>(d_val);
+    }
+    workgroupBarrier();
+
+    // ---------- Phase 3: quantize this lane's 4 elements ----------
+    let amax_final = wg_amax_final;
+    let iscale = wg_iscale;
+    var q0 : i32 = 0;
+    var q1 : i32 = 0;
+    var q2 : i32 = 0;
+    var q3 : i32 = 0;
+    if (amax_final > 0.0) {
+        let base = lane * VPT;
+        let x0 = v_input1[block_input_off + base + 0u];
+        let x1 = v_input1[block_input_off + base + 1u];
+        let x2 = v_input1[block_input_off + base + 2u];
+        let x3 = v_input1[block_input_off + base + 3u];
+        // Match CPU exactly: `(iscale * xs[j]).round().min(127.) as i8`.
+        // Rust's f32 `as i8` saturates negatives to -128, so the full
+        // clamp is [-128, 127]. Tied half-cases must round AWAY from
+        // zero (Rust convention).
+        q0 = i32(clamp(round_half_away(iscale * x0), -128.0, 127.0));
+        q1 = i32(clamp(round_half_away(iscale * x1), -128.0, 127.0));
+        q2 = i32(clamp(round_half_away(iscale * x2), -128.0, 127.0));
+        q3 = i32(clamp(round_half_away(iscale * x3), -128.0, 127.0));
+    }
+    // Stage into workgroup memory for phase 4 (bsums) AND write to dest.
+    let base = lane * VPT;
+    wg_qs[base + 0u] = q0;
+    wg_qs[base + 1u] = q1;
+    wg_qs[base + 2u] = q2;
+    wg_qs[base + 3u] = q3;
+
+    // qs is packed 4 bytes per u32, lane-local: lane writes word
+    // `block_word_off + Q8K_QS_WORD_OFFSET + lane`.
+    v_dest_u32[block_word_off + Q8K_QS_WORD_OFFSET + lane] = pack_i8x4(q0, q1, q2, q3);
+    workgroupBarrier();
+
+    // ---------- Phase 4: bsums (16 sub-blocks, 16 elems each) ----------
+    // 8 lanes (0..7) each compute and pack two adjacent bsums into one
+    // u32 word. The CPU computes bsums as i32 then casts to i16 (a
+    // wrapping truncation); we mask to 0xFFFF on pack which has the
+    // same on-disk bit pattern. 16 * 127 = 2032 fits in i16 easily so
+    // truncation never actually happens for valid Q8K input, but we
+    // preserve the bit-exact convention.
+    if (lane < 8u) {
+        let j0 = lane * 2u;
+        let j1 = j0 + 1u;
+        var s0 : i32 = 0;
+        var s1 : i32 = 0;
+        for (var ii : u32 = 0u; ii < 16u; ii = ii + 1u) {
+            s0 = s0 + wg_qs[j0 * 16u + ii];
+            s1 = s1 + wg_qs[j1 * 16u + ii];
+        }
+        v_dest_u32[block_word_off + Q8K_BSUMS_WORD_OFFSET + lane] = pack_i16x2(s0, s1);
+    }
+}
+
+#endif // f32

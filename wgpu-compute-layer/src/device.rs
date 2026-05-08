@@ -182,6 +182,12 @@ pub struct WgpuDeviceInner {
     pub adapter_info: wgpu::AdapterInfo,
     pub device_limits: wgpu::Limits, // we cache the limits here because `device.limits()` was relatively slow in the browser
     device_features: wgpu::Features,
+    /// Whether the WGSL frontend (naga / browser Tint) supports the
+    /// `packed_4x8_integer_dot_product` language extension. Probed at
+    /// `Instance` creation. The Q4_K int-domain matmul kernel uses
+    /// `dot4I8Packed`, which `requires` this extension; when false,
+    /// the dispatcher must fall back to the legacy f32-dequant path.
+    supports_dp4a: bool,
 
     pub(crate) queue: wgpu::Queue,
 
@@ -357,6 +363,11 @@ impl WgpuDevice {
             ..InstanceDescriptor::new_without_display_handle()
         });
 
+        let supports_dp4a = instance
+            .wgsl_language_features()
+            .contains(wgpu::WgslLanguageFeatures::Packed4x8IntegerDotProduct);
+        log::info!("WGSL packed_4x8_integer_dot_product: {}", supports_dp4a);
+
         // `request_adapter` instantiates the general connection to the GPU
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -441,6 +452,7 @@ impl WgpuDevice {
                 device,
                 device_limits,
                 device_features: features,
+                supports_dp4a,
                 backend: adapter_info.backend,
                 adapter_info,
                 queue,
@@ -577,6 +589,13 @@ impl WgpuDevice {
             debug: None,
         });
         command_queue.core.command_queue.push(q);
+    }
+
+    /// Whether the WGSL frontend supports the
+    /// `packed_4x8_integer_dot_product` language extension (i.e.
+    /// `dot4I8Packed`). Probed once at instance creation.
+    pub fn supports_dp4a(&self) -> bool {
+        self.supports_dp4a
     }
 
     /// Returns true when the given `DType` is supported by this device.

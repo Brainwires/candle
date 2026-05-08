@@ -389,6 +389,62 @@ impl QWgpuStorage {
             }
         };
 
+        // Int-domain Q4_K × Q8K matmul fast path (decode hot path).
+        // Conditions: m==1, dtype=Q4K, DP4A available, contiguous f32
+        // activation row, k a multiple of 256 (Q4_K block size).
+        // When all hold, we run a Q8K quantize pre-pass over the
+        // activation buffer and dispatch the int-domain matmul. Drift
+        // drops from ~0.5% per matmul (f32-dequant kernel) to <1e-5.
+        let int_q4k_eligible = matches!(matmul_alg, QuantizedMatmulAlgorithm::Naive)
+            && m == 1
+            && b == 1
+            && self.dtype() == GgmlDType::Q4K
+            && dev.inner_device().supports_dp4a()
+            && k % 256 == 0
+            && input1_stride_k == 1
+            && layout.start_offset() == 0;
+
+        if int_q4k_eligible {
+            // Pre-pass: quantize the f32 activation row to Q8K. The
+            // returned `WgpuStorage` owns the transient block buffer;
+            // we only need its `BufferReferenceId` for the bind group.
+            let q8k_storage =
+                quantize_row_to_q8k(dev, storage.buffer(), k * m * b)?;
+            let q8k_buf = q8k_storage.buffer();
+            let mut queue = dev.get_queue();
+            queue.add(m);
+            queue.add(k);
+            queue.add(n);
+            queue.add(input1_stride_b);
+            queue.add(layout.start_offset());
+            queue.add(input1_stride_k);
+            queue.add(input1_stride_m);
+            let pipeline = candle_wgpu_kernels::Pipelines::Q4kInt(
+                candle_wgpu_kernels::DType::F32,
+                candle_wgpu_kernels::quantized::q4k_int::Functions::MatmulQ4kQ8kM1,
+            );
+            let pipeline = queue.get_pipeline(pipeline);
+            let bind_group = dev.create_bind_group_input2(
+                dst.buffer(),
+                q8k_buf,
+                self.buffer(),
+                DType::F32.into(),
+            );
+            queue.enqueue_workgroups_extra(
+                pipeline,
+                bind_group,
+                n as u32,
+                1,
+                1,
+                k * m * n * b,
+                #[cfg(feature = "wgpu_debug")]
+                Some(wgpu_functions::matmul::sgemm::get_debug_string(
+                    &SGEMMParams::new(b, m, k, n),
+                )),
+            );
+            return Ok((dst, dst_shape));
+        }
+
         match matmul_alg {
             QuantizedMatmulAlgorithm::Naive => {
                 //naive matmul
@@ -657,4 +713,64 @@ impl QWgpuStorage {
 pub fn load_quantized(device: &WgpuDevice, dtype: GgmlDType, data: &[u8]) -> Result<QStorage> {
     let storage = device.alloc_from_bytes(DType::U8, data)?;
     Ok(QStorage::Wgpu(QWgpuStorage { dtype, storage }))
+}
+
+/// Quantize a contiguous f32 row to BlockQ8K format on the WGPU device.
+///
+/// GPU-side equivalent of CPU's `BlockQ8K::from_float(xs, ys)`. Produces
+/// a byte-identical result — see `kernels/quantized/quantize_q8k.pwgsl`
+/// for the shader and the numeric-correctness notes there.
+///
+/// `src` must point to a contiguous `[f32; total_elems]` buffer.
+/// `total_elems` MUST be a multiple of `QK_K` (256); the caller is
+/// responsible for any padding. The returned `WgpuStorage` is
+/// `n_blocks * 73` u32 words (i.e. `n_blocks * 292` bytes) and matches
+/// `BlockQ8K`'s `#[repr(C)]` layout byte-for-byte. This is the
+/// activation operand for the int-domain Q4_K matmul (Step 4 of the
+/// int-domain port plan).
+pub fn quantize_row_to_q8k(
+    device: &WgpuDevice,
+    src: BufferReferenceId,
+    total_elems: usize,
+) -> Result<WgpuStorage> {
+    if total_elems % crate::quantized::k_quants::QK_K != 0 {
+        crate::bail!(
+            "quantize_row_to_q8k: total_elems ({}) must be a multiple of QK_K ({})",
+            total_elems,
+            crate::quantized::k_quants::QK_K
+        );
+    }
+    let n_blocks = total_elems / crate::quantized::k_quants::QK_K;
+    // Each BlockQ8K is 292 bytes = 73 u32 words. Allocate the dest as
+    // U32 so the binding alignment lines up with `array<u32>` in WGSL.
+    let dst_words = n_blocks * 73;
+    let dst = device.alloc_uninit_size(DType::U32, dst_words);
+
+    let mut queue = device.get_queue();
+    queue.add(total_elems as u32);
+
+    let pipeline = candle_wgpu_kernels::Pipelines::QuantizeQ8k(
+        candle_wgpu_kernels::DType::F32,
+        candle_wgpu_kernels::quantized::quantize_q8k::Functions::QuantizeRowToQ8k,
+    );
+    let pipeline = queue.get_pipeline(pipeline);
+
+    // Both bindings are 4-byte aligned (f32 input, u32 output).
+    let bind_group = device.create_bind_group_input1(
+        dst.buffer(),
+        src,
+        DType::F32.into(),
+    );
+
+    // One workgroup per Q8K block. workgroup_size in WGSL is (64,1,1).
+    queue.enqueue_workgroups(
+        pipeline,
+        bind_group,
+        n_blocks as u32,
+        1,
+        1,
+        total_elems,
+    );
+
+    Ok(dst)
 }

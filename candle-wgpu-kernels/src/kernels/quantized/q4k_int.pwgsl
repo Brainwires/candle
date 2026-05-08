@@ -1,0 +1,332 @@
+// Int-domain Q4_K x Q8K matmul (decode-path, m=1).
+//
+// MIRROR of CPU `vec_dot_q4k_q8k` in
+// candle-core/src/quantized/k_quants.rs (lines ~1372-1452):
+//
+//   for super_block in 0..K/256:
+//     acc_int = 0_i32
+//     for g in 0..8:                                  # 8 sub-blocks of 32 elems
+//         sg = 0_i32
+//         for i in 0..32:
+//             sg += i32(q4[g*32+i]) * i32(q8[g*32+i]) # i8×i8→i32, exact
+//         acc_int += i32(scales[g]) * sg              # still i32
+//
+//     block_min_i32 = sum(i32(mins[g]) * i32(bsums[2g] + bsums[2g+1]) for g in 0..8)
+//
+//     out += (f32(d_x) * d_y) * f32(acc_int)
+//          - (f32(dmin_x) * d_y) * f32(block_min_i32)
+//
+// Note on bsums vs mins indexing: CPU's loop is
+//   for j in 0..QK_K/16 = 16:
+//     sumi += y.bsums[j] * mins[j/2]
+// so each `mins[g]` (g in 0..8) is multiplied by (bsums[2g] + bsums[2g+1]).
+//
+// Why int-domain: per-element f32 dequant-and-multiply produced ~0.5%
+// drift per matmul. The int-domain kernel computes one i32 dot per
+// sub-block (exact, no rounding) and applies a single f32 scale per
+// super-block, dropping drift to <1e-5 vs CPU.
+//
+// Bindings (group 0):
+//   binding 0  v_dest_f32   : array<f32>  (output, length n*b)
+//   binding 2  v_input1_u32 : array<u32>  (Q8K activation, 73 u32 / block)
+//   binding 3  v_input2_u32 : array<u32>  (Q4_K weights, 36 u32 / block)
+//   immediate  op_matmul    : 7 u32 (m, k, n, stride_b, offset, stride_k, stride_m)
+//
+// Dispatch shape: (n, 1, 1) — one workgroup per output element.
+//   workgroup_size = (64, 1, 1)
+//
+// Lane partition (64 lanes / 8 sub-blocks per super-block = 8 super-blocks
+// per outer pass):
+//   lane = lid.x
+//   my_g          = lane % 8                       # which sub-block
+//   my_sb_offset  = lane / 8                       # which super-block (0..7)
+//   for sb_outer in 0..ceil(num_super_blocks / 8):
+//       sb = sb_outer * 8 + my_sb_offset
+//       if sb < num_super_blocks: process (sb, my_g)
+//
+// For K = 2048: num_super_blocks = 8, single outer pass, all 64 lanes
+// active. For K = 1024: 4 super-blocks, single pass, 32 lanes active.
+// For K = 4096: 16 super-blocks, 2 passes. Etc.
+//
+// Reduction is performed at the SUPER-BLOCK granularity so the f32
+// multiply happens once per super-block (matching the algorithm spec
+// exactly). Each lane writes its (i32 scale-acc, i32 min-acc) pair into
+// workgroup memory; lane 0 of each 8-lane group reduces over the group,
+// applies the f32 scale, and writes the f32 result. Lane 0 of the
+// workgroup then sums those f32 results into the output.
+
+requires packed_4x8_integer_dot_product;
+
+#include "../util.pwgsl"
+
+#ifdef f32
+
+LOAD_INFO(op_matmul, 7)
+#define op_matmul_m                 op_matmul[0]
+#define op_matmul_k                 op_matmul[1]
+#define op_matmul_n                 op_matmul[2]
+// stride/offset of activation tensor in the ORIGINAL f32 layout; the
+// caller has already pre-quantized to Q8K, so the dispatch only fires
+// when offset==0 / stride_k==1 / b==1. We keep the shape for binding
+// compatibility but read directly from the Q8K buffer.
+#define op_matmul_input1_stride_b   op_matmul[3]
+#define op_matmul_input1_offset     op_matmul[4]
+
+const Q4K_BLOCK_BYTES   : u32 = 144u;       // 2 + 2 + 12 + 128
+const Q4K_BLOCK_WORDS   : u32 = 36u;        // 144 / 4
+const Q4K_HEADER_WORDS  : u32 = 4u;         // 2(d/dmin) + 12(scales) bytes = 16 bytes = 4 words
+const Q4K_QS_WORD_OFF   : u32 = 4u;         // qs starts at byte 16 = word 4
+
+const Q8K_BLOCK_WORDS   : u32 = 73u;
+const Q8K_QS_WORD_OFF   : u32 = 1u;
+const Q8K_BSUMS_WORD_OFF: u32 = 65u;        // 1 (d) + 64 (qs words)
+
+const NUM_SUB_BLOCKS    : u32 = 8u;         // per super-block
+const SB_PER_PASS       : u32 = 8u;         // workgroup processes up to 8 super-blocks per outer iter
+
+// Per-lane staging for sub-block-result reduction. Indexed by lane.
+// We stash sg (i32), and the per-lane min term (mins[g] * bsums[2g] + bsums[2g+1]).
+var<workgroup> wg_sg          : array<i32, 64>;
+var<workgroup> wg_min_term    : array<i32, 64>;
+// One f32 accumulator per super-block (8 entries used per outer pass).
+// Re-zeroed each outer pass.
+var<workgroup> wg_sb_result   : array<f32, SB_PER_PASS>;
+// Final per-workgroup output accumulator (lane 0 reads/writes).
+var<workgroup> wg_out         : f32;
+
+// Decode the 6-bit `scales[g]` and `mins[g]` for a sub-block index `g`
+// in [0,8). Reads three header words `w0`, `w1`, `w2` (12 bytes of
+// scales) and unpacks via the standard Q4_K bit pattern (matches the
+// existing q4_k.pwgsl logic). Returns (scale, min) packed as
+// vec2<u32>.
+fn unpack_q4k_scale_min(g: u32, w0: u32, w1: u32, w2: u32) -> vec2<u32> {
+    // Extract bytes b0..b11 from w0/w1/w2.
+    let b0  =  w0         & 0xFFu;
+    let b1  = (w0 >> 8u)  & 0xFFu;
+    let b2  = (w0 >> 16u) & 0xFFu;
+    let b3  = (w0 >> 24u) & 0xFFu;
+    let b4  =  w1         & 0xFFu;
+    let b5  = (w1 >> 8u)  & 0xFFu;
+    let b6  = (w1 >> 16u) & 0xFFu;
+    let b7  = (w1 >> 24u) & 0xFFu;
+    let b8  =  w2         & 0xFFu;
+    let b9  = (w2 >> 8u)  & 0xFFu;
+    let b10 = (w2 >> 16u) & 0xFFu;
+    let b11 = (w2 >> 24u) & 0xFFu;
+
+    var sc: u32 = 0u;
+    var m:  u32 = 0u;
+    switch g {
+        case 0u: { sc = b0 & 0x3Fu;  m = b4 & 0x3Fu; }
+        case 1u: { sc = b1 & 0x3Fu;  m = b5 & 0x3Fu; }
+        case 2u: { sc = b2 & 0x3Fu;  m = b6 & 0x3Fu; }
+        case 3u: { sc = b3 & 0x3Fu;  m = b7 & 0x3Fu; }
+        case 4u: { sc = (b8  & 0xFu) | (((b0 >> 6u) & 0x3u) << 4u);
+                   m  = ((b8  >> 4u) & 0xFu) | (((b4 >> 6u) & 0x3u) << 4u); }
+        case 5u: { sc = (b9  & 0xFu) | (((b1 >> 6u) & 0x3u) << 4u);
+                   m  = ((b9  >> 4u) & 0xFu) | (((b5 >> 6u) & 0x3u) << 4u); }
+        case 6u: { sc = (b10 & 0xFu) | (((b2 >> 6u) & 0x3u) << 4u);
+                   m  = ((b10 >> 4u) & 0xFu) | (((b6 >> 6u) & 0x3u) << 4u); }
+        default: { sc = (b11 & 0xFu) | (((b3 >> 6u) & 0x3u) << 4u);
+                   m  = ((b11 >> 4u) & 0xFu) | (((b7 >> 6u) & 0x3u) << 4u); }
+    }
+    return vec2<u32>(sc, m);
+}
+
+// Pack 4 nibbles (each 0..15, in the LOW 4 bits of the input u32s) as
+// 4 sign-extendable bytes. Since the values are 0..15, sign extension
+// preserves them when the receiver treats the byte as i8.
+fn pack_nibbles4_as_bytes(n0: u32, n1: u32, n2: u32, n3: u32) -> u32 {
+    return (n0 & 0xFu)
+         | ((n1 & 0xFu) << 8u)
+         | ((n2 & 0xFu) << 16u)
+         | ((n3 & 0xFu) << 24u);
+}
+
+// Process one (super_block, g) sub-block. Returns (sg_i32, min_term_i32).
+// `q4_block_word_off` is the starting u32 word index of this Q4_K block.
+// `q8_block_word_off` is the starting u32 word index of this Q8K block.
+fn process_subblock(
+    g: u32,
+    sc: i32,
+    m: i32,
+    q4_block_word_off: u32,
+    q8_block_word_off: u32,
+) -> vec2<i32> {
+    // Q4_K nibble layout for one super-block (256 elems):
+    //   The 128 weight bytes encode 256 nibbles. Each PAIR of sub-blocks
+    //   (2g, 2g+1) shares the same 32 weight bytes (= 8 u32 words):
+    //     - sub-block 2g  uses the LOW nibbles  (q & 0x0F)
+    //     - sub-block 2g+1 uses the HIGH nibbles ((q >> 4) & 0x0F)
+    //   ... per the existing q4_k.pwgsl decoder (lines 146-174).
+    //
+    // NB: this is NOT the same as "sub-block g uses bytes [g*16..g*16+16)";
+    // the canonical layout pairs sub-blocks by (low,high) within 32 bytes.
+    //
+    // For sub-block g (in 0..8):
+    //   pair_index   = g / 2          (which 32-byte pair: 0..3)
+    //   use_high     = (g & 1) != 0   (false → low nibbles, true → high)
+    //   pair_byte_off (within Q4_K block) = QS_OFFSET + pair_index * 32
+    //                                     = 16 + pair_index * 32
+    let pair_index = g >> 1u;
+    let use_high   = (g & 1u) != 0u;
+    let pair_word_off = q4_block_word_off + Q4K_QS_WORD_OFF + pair_index * 8u;
+
+    // The 32 elements of this sub-block in the Q8K block live at
+    // qs[g*32 .. g*32+32]. Q8K stores 4 i8 per u32 word, so the 32
+    // elements are 8 contiguous u32 words at:
+    //   q8_block_word_off + Q8K_QS_WORD_OFF + g * 8
+    let q8_word_off = q8_block_word_off + Q8K_QS_WORD_OFF + g * 8u;
+
+    // Compute sg = sum_{i=0..32} i8(q4[i]) * i8(q8[i])
+    var sg: i32 = 0;
+    for (var k: u32 = 0u; k < 8u; k = k + 1u) {
+        // Read 4 packed nibble-pairs (covers 4 elements of low or 4
+        // elements of high).
+        let packed = v_input2_u32[pair_word_off + k];
+        var n0: u32; var n1: u32; var n2: u32; var n3: u32;
+        if (use_high) {
+            n0 = (packed >> 4u)  & 0xFu;
+            n1 = (packed >> 12u) & 0xFu;
+            n2 = (packed >> 20u) & 0xFu;
+            n3 = (packed >> 28u) & 0xFu;
+        } else {
+            n0 =  packed         & 0xFu;
+            n1 = (packed >> 8u)  & 0xFu;
+            n2 = (packed >> 16u) & 0xFu;
+            n3 = (packed >> 24u) & 0xFu;
+        }
+        let q4_word = pack_nibbles4_as_bytes(n0, n1, n2, n3);
+        let q8_word = v_input1_u32[q8_word_off + k];
+        sg = sg + dot4I8Packed(q4_word, q8_word);
+    }
+
+    // Min term: i32(m) * (i32(bsums[2g]) + i32(bsums[2g+1])).
+    // bsums is array of 16 i16, packed 2 per u32 (low half first).
+    // bsum[j] lives in word `Q8K_BSUMS_WORD_OFF + j/2`, half j%2.
+    let j0 = 2u * g;
+    let j1 = 2u * g + 1u;
+    let bsums_w0 = v_input1_u32[q8_block_word_off + Q8K_BSUMS_WORD_OFF + (j0 >> 1u)];
+    let bsums_w1 = v_input1_u32[q8_block_word_off + Q8K_BSUMS_WORD_OFF + (j1 >> 1u)];
+    // Sign-extend i16 from u32. (j0 & 1) selects which half (0 = low, 1 = high).
+    let half0_shift: u32 = (j0 & 1u) * 16u;
+    let half1_shift: u32 = (j1 & 1u) * 16u;
+    let bs0_u: u32 = (bsums_w0 >> half0_shift) & 0xFFFFu;
+    let bs1_u: u32 = (bsums_w1 >> half1_shift) & 0xFFFFu;
+    // Sign-extend 16-bit -> 32-bit via shift trick:
+    //   (i32(u32 << 16) >> 16) replicates the sign bit.
+    let bs0: i32 = (i32(bs0_u << 16u)) >> 16u;
+    let bs1: i32 = (i32(bs1_u << 16u)) >> 16u;
+
+    let min_term: i32 = m * (bs0 + bs1);
+    let scale_term: i32 = sc * sg;
+    return vec2<i32>(scale_term, min_term);
+}
+
+@compute @workgroup_size(64, 1, 1)
+fn matmul_q4k_q8k_m1(
+    @builtin(workgroup_id) wg_id: vec3<u32>,
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let row: u32 = wg_id.x; // output column index (one per workgroup)
+    let n: u32 = op_matmul_n;
+    if (row >= n) {
+        return;
+    }
+    let lane: u32 = lid.x;
+    let k: u32 = op_matmul_k;
+    let num_super_blocks: u32 = k / 256u;
+
+    // Q4_K weight row offset (each output column is one row of the
+    // weight matrix; row stride = num_super_blocks * Q4K_BLOCK_WORDS).
+    let q4_row_word_off: u32 = row * num_super_blocks * Q4K_BLOCK_WORDS;
+
+    let my_g: u32 = lane & 7u;          // 0..7
+    let my_sb_offset: u32 = lane >> 3u; // 0..7
+
+    if (lane == 0u) {
+        wg_out = 0.0;
+    }
+    workgroupBarrier();
+
+    let num_outer: u32 = (num_super_blocks + SB_PER_PASS - 1u) / SB_PER_PASS;
+    for (var outer: u32 = 0u; outer < num_outer; outer = outer + 1u) {
+        let sb: u32 = outer * SB_PER_PASS + my_sb_offset;
+        let sb_valid: bool = sb < num_super_blocks;
+
+        // Per-lane scale_term (sc * sg) and min_term (m * (bsum0+bsum1)).
+        var scale_term: i32 = 0;
+        var min_term:   i32 = 0;
+        var sb_d: f32 = 0.0;
+        var sb_dmin: f32 = 0.0;
+        var sb_dy: f32 = 0.0;
+
+        if (sb_valid) {
+            let q4_block_word_off = q4_row_word_off + sb * Q4K_BLOCK_WORDS;
+            let q8_block_word_off = sb * Q8K_BLOCK_WORDS;
+
+            // Header word: low half = d (f16), high half = dmin (f16).
+            let header = v_input2_u32[q4_block_word_off];
+            sb_d    = half_to_float(header & 0xFFFFu);
+            sb_dmin = half_to_float((header >> 16u) & 0xFFFFu);
+
+            // Read scales (12 bytes) at words [q4_block_word_off+1 .. +4).
+            let w0 = v_input2_u32[q4_block_word_off + 1u];
+            let w1 = v_input2_u32[q4_block_word_off + 2u];
+            let w2 = v_input2_u32[q4_block_word_off + 3u];
+            let scm = unpack_q4k_scale_min(my_g, w0, w1, w2);
+            let sc_i: i32 = i32(scm.x);
+            let m_i:  i32 = i32(scm.y);
+
+            // Q8K block: word 0 is f32 d_y.
+            sb_dy = bitcast<f32>(v_input1_u32[q8_block_word_off]);
+
+            let pair = process_subblock(my_g, sc_i, m_i, q4_block_word_off, q8_block_word_off);
+            scale_term = pair.x;
+            min_term   = pair.y;
+        }
+
+        wg_sg[lane]       = scale_term;
+        wg_min_term[lane] = min_term;
+        workgroupBarrier();
+
+        // Per-super-block reduction: lane 0 of each 8-lane group sums
+        // the 8 sub-blocks' (scale_term, min_term) into i32 totals,
+        // then applies the single f32 scale and writes one entry to
+        // wg_sb_result.
+        if (my_g == 0u && sb_valid) {
+            // Re-derive d/dmin/d_y for this super-block (they're
+            // identical for all 8 lanes in the group, but only this
+            // lane keeps a copy).
+            let base_lane = my_sb_offset * 8u;
+            var acc_int: i32 = 0;
+            var min_int: i32 = 0;
+            for (var ll: u32 = 0u; ll < 8u; ll = ll + 1u) {
+                acc_int = acc_int + wg_sg[base_lane + ll];
+                min_int = min_int + wg_min_term[base_lane + ll];
+            }
+            let block_result = (sb_d * sb_dy) * f32(acc_int)
+                             - (sb_dmin * sb_dy) * f32(min_int);
+            wg_sb_result[my_sb_offset] = block_result;
+        } else if (my_g == 0u) {
+            wg_sb_result[my_sb_offset] = 0.0;
+        }
+        workgroupBarrier();
+
+        // Lane 0 sums up to 8 super-block results into wg_out.
+        if (lane == 0u) {
+            var s: f32 = wg_out;
+            for (var i: u32 = 0u; i < SB_PER_PASS; i = i + 1u) {
+                s = s + wg_sb_result[i];
+            }
+            wg_out = s;
+        }
+        workgroupBarrier();
+    }
+
+    if (lane == 0u) {
+        v_dest[row] = wg_out;
+    }
+}
+
+#endif // f32
