@@ -206,10 +206,62 @@ impl QEmbedding {
     }
 }
 
+/// KV cache backed by `ConcatKvCache` (cat-based append).
+///
+/// We deliberately do NOT use the standard `KvCache`/`RotatingKvCache`
+/// because both rely on `Tensor::slice_set`, which dispatches to the
+/// `copy2d` WGSL kernel. On the browser-WGPU path (Chrome/Dawn → Tint
+/// → MSL on macOS Metal) the writes from `copy2d` are not reliably
+/// visible to subsequent reads of the destination buffer — a write-
+/// coherence issue tracked in wgpu#3181 / wgpu#2554. Symptom in
+/// quantized_gemma4 was the model emitting the same token twice on
+/// the 4th decode step ("Hi! How do do…") and never reaching EOS.
+///
+/// `ConcatKvCache::append` uses `Tensor::cat`, which allocates a
+/// fresh destination buffer each call — fresh writes are always
+/// visible. Slower in theory (O(n²) total work over a generation)
+/// but the chat-pwa decode loop is dominated by the GPU→CPU argmax
+/// readback (~330 ms/token) anyway, so end-to-end perf is unchanged.
+///
+/// For sliding-window layers we wrap the concat cache with manual
+/// trim-to-window logic — replicating `RotatingKvCache`'s behavior
+/// without its `slice_set` dependency.
 #[derive(Debug, Clone)]
-enum KvCache {
-    Normal(candle_nn::kv_cache::KvCache),
-    Rotating(candle_nn::kv_cache::RotatingKvCache),
+struct KvCache {
+    inner: candle_nn::kv_cache::ConcatKvCache,
+    /// `None` for full-attention layers. `Some(window)` for sliding
+    /// layers — after each append we narrow the cache to the last
+    /// `window` positions on the seq dim (dim=2 = `[B, H, S, D]`).
+    sliding_window: Option<usize>,
+}
+
+impl KvCache {
+    fn new(sliding_window: Option<usize>) -> Self {
+        Self {
+            inner: candle_nn::kv_cache::ConcatKvCache::new(2),
+            sliding_window,
+        }
+    }
+
+    fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<(Tensor, Tensor)> {
+        let (k_full, v_full) = self.inner.append(k, v)?;
+        if let Some(window) = self.sliding_window {
+            let len = k_full.dim(2)?;
+            if len > window {
+                let start = len - window;
+                let k_trim = k_full.narrow(2, start, window)?.contiguous()?;
+                let v_trim = v_full.narrow(2, start, window)?.contiguous()?;
+                self.inner.reset();
+                let (k_full, v_full) = self.inner.append(&k_trim, &v_trim)?;
+                return Ok((k_full, v_full));
+            }
+        }
+        Ok((k_full, v_full))
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
 }
 
 /// Per-step shared K/V store. Donor layers write `(k, v)` here after
@@ -527,10 +579,7 @@ impl Attention {
             };
             let v = v.contiguous()?;
             let k = k_rot.contiguous()?;
-            let (k_full, v_full) = match &mut self.kv_cache {
-                KvCache::Normal(c) => c.append(&k, &v)?,
-                KvCache::Rotating(c) => c.append(&k, &v)?,
-            };
+            let (k_full, v_full) = self.kv_cache.append(&k, &v)?;
             shared_kv_store[self.layer_idx] = Some((k_full.clone(), v_full.clone()));
             (q_rot, k_full, v_full)
         };
@@ -574,10 +623,7 @@ impl Attention {
     }
 
     fn clear_kv_cache(&mut self) {
-        match &mut self.kv_cache {
-            KvCache::Normal(c) => c.reset(),
-            KvCache::Rotating(c) => c.reset(),
-        }
+        self.kv_cache.reset();
     }
 }
 
@@ -1075,29 +1121,15 @@ impl ModelWeights {
                 )?)
             };
 
+            // Cat-based KV cache (no `slice_set` / `copy2d` — see KvCache
+            // comment above for the wgpu coherence rationale). Sliding
+            // layers carry the window so the cache trims itself after
+            // each append, full layers grow unbounded (capped by the
+            // generation length).
             let kv_cache = if is_sliding {
-                KvCache::Rotating(candle_nn::kv_cache::RotatingKvCache::new(2, cfg.effective_sliding_window()))
+                KvCache::new(Some(cfg.effective_sliding_window()))
             } else {
-                // Full-attention layers used to pass `cfg.max_position_embeddings`
-                // (32768 for Gemma 4 E2B) directly. `KvCache::Cache::append`
-                // lazily allocates `[B, num_kv_heads, max_seq_len, head_dim]`
-                // on first call — at head_dim=512, num_kv_heads=4, that's
-                // ~536 MB per full layer. Gemma 4 E2B has 7 full layers
-                // (one every 5 layers across 35 total), so the cumulative
-                // allocation is ~3.75 GB and overflows wasm32's 4 GB
-                // address space mid-prefill (typically traps inside L14's
-                // first kv_cache.append, the 3rd full layer).
-                //
-                // Cap the *initial* capacity at `KV_CACHE_INITIAL_CAP`
-                // (still grows on demand via `Cache::append`'s
-                // grow-and-concat path). 4 KB tokens covers the vast
-                // majority of single-turn chats; longer contexts pay one
-                // realloc per `KV_CACHE_INITIAL_CAP` tokens. Native
-                // builds were also wasting memory at the old size; the
-                // cap helps everyone.
-                const KV_CACHE_INITIAL_CAP: usize = 4096;
-                let initial = cfg.max_position_embeddings.min(KV_CACHE_INITIAL_CAP);
-                KvCache::Normal(candle_nn::kv_cache::KvCache::new(2, initial))
+                KvCache::new(None)
             };
 
             let self_attn = Attention {
