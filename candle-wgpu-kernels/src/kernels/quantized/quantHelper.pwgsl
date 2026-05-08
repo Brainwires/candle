@@ -113,11 +113,21 @@ fn matmul_naive_block(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let m_input2_offset = (input2_offset + op_matmul_k * x//+ b * input2_stride_b
         ) / BLOCK_SIZE;
 
+    // Kahan compensated summation. The previous `sum += a * b` pattern
+    // accumulated 2048 f32 multiply-adds into a single f32 register.
+    // Worst-case rounding error grows linearly with element count
+    // (~n * eps * |sum|), which on Q4_K's (d1*q - m1) dequant can
+    // produce ~0.5% per matmul drift versus CPU's i32-accumulated path.
+    // Stacked across 35 layers × ~6 matmuls each, the drift compounds
+    // into the verbose-no-EOS symptom. Kahan keeps the compensation
+    // term `c` so the running sum tracks the high bits exactly,
+    // dropping the error to O(eps) regardless of n.
     var sum = ZERO;
+    var c = ZERO; // Kahan compensation (running rounding-error correction)
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        #define CALLBACK(idx,value, idx2) sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
+        #define CALLBACK(idx,value, idx2) { let __y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let __t = sum + __y; c = (__t - sum) - __y; sum = __t; }
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
@@ -126,7 +136,7 @@ fn matmul_naive_block(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         blk += 1u;
     }
-    v_dest[b * output_size_of_one_batch + 
+    v_dest[b * output_size_of_one_batch +
     y * op_matmul_n + x] = sum;
 }
 
@@ -152,11 +162,13 @@ fn matmul_naive_block_m1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let m_input2_offset = (input2_offset + op_matmul_k * x// + b * input2_stride_b
     ) / BLOCK_SIZE;
 
+    // Kahan compensated summation — see matmul_naive_block above.
     var sum = ZERO;
+    var c = ZERO;
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        #define CALLBACK(idx,value, idx2) sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
+        #define CALLBACK(idx,value, idx2) { let __y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let __t = sum + __y; c = (__t - sum) - __y; sum = __t; }
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
