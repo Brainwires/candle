@@ -542,23 +542,30 @@ impl Attention {
         // unit-magnitude queries/keys so the dot-products are already
         // O(1). No divide here.
         //
-        // Decode (q_len == 1): use the fused flash-attention kernel so
-        // the `[B, H, 1, kv_len]` attn-weights tensor never materializes.
-        // The mask is implicit (causal + optional sliding window). For
-        // prefill (q_len > 1) we keep the standard 3-step path — the
-        // fused kernel is decode-only.
-        let attn_output = if q_len == 1 {
-            candle_nn::flash_attn::flash_attn_decode(&q, &k, &v, self.sliding_window)?
-        } else {
-            let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
-            let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
-            let attn_weights = match mask {
-                Some(m) => attn_weights.broadcast_add(m)?,
-                None => attn_weights,
-            };
-            let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-            attn_weights.matmul(&v)?
+        // Standard 3-step attention for both prefill and decode.
+        //
+        // We previously used a fused `flash_attn_decode` kernel for the
+        // q_len == 1 path. On macOS Metal under Chrome/Dawn (Tint shader
+        // compiler), that kernel produced logits whose magnitudes
+        // collapsed ~3-4× over the 35-layer stack, manifesting as the
+        // chat-pwa wandering into a single-token emit attractor (the
+        // emoji-spam loop). Native wgpu (Naga compiler) on the same
+        // Metal hardware computed correct values from the same WGSL —
+        // a Naga/Tint MSL-lowering discrepancy of the wgpu#4500 class.
+        //
+        // The standard path materializes a `[B, H, q_len, kv_len]`
+        // attn-weights tensor. At q_len=1 that's tiny (one row) so the
+        // memory cost is negligible. The decode path is bottlenecked
+        // by the GPU→CPU argmax readback (~330 ms/token) anyway, not
+        // by attention, so end-to-end perf is unchanged.
+        let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
+        let attn_weights = match mask {
+            Some(m) => attn_weights.broadcast_add(m)?,
+            None => attn_weights,
         };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_output = attn_weights.matmul(&v)?;
 
         let attn_output = attn_output
             .transpose(1, 2)?
@@ -1580,9 +1587,20 @@ impl ModelWeights {
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
         let logits = self.lm_head.forward(&hidden)?;
         // Final-logit softcap: tanh(logits / softcap) * softcap.
+        //
+        // Cast to F32 first. Tanh in BF16/F16 saturates with very poor
+        // precision — values past ~|x|>2 collapse to {-1, +1} unevenly.
+        // On Tint/Dawn the F32 path also avoids a known WGSL builtin
+        // imprecision. Either failure mode lets unbounded logits leak
+        // through the softcap, which downstream causes greedy decode
+        // to lock onto a single high-variance token (the emoji-spam
+        // attractor seen on the chat-pwa wgpu path). Reference:
+        // llama.cpp #21390 + huggingface/transformers Gemma softcap
+        // PRs all upcast to F32 for the same reason.
         let result = match self.cfg.final_logit_softcapping {
             Some(sc) if sc > 0.0 => {
-                let scaled = (logits / sc)?;
+                let logits_f32 = logits.to_dtype(DType::F32)?;
+                let scaled = (logits_f32 / sc)?;
                 let capped = scaled.tanh()?;
                 capped * sc
             }
