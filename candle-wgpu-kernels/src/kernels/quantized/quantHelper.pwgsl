@@ -127,7 +127,7 @@ fn matmul_naive_block(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        #define CALLBACK(idx,value, idx2) { let __y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let __t = sum + __y; c = (__t - sum) - __y; sum = __t; }
+        #define CALLBACK(idx,value, idx2) { let kahan_y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let kahan_t = sum + kahan_y; c = (kahan_t - sum) - kahan_y; sum = kahan_t; }
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
@@ -168,7 +168,7 @@ fn matmul_naive_block_m1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        #define CALLBACK(idx,value, idx2) { let __y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let __t = sum + __y; c = (__t - sum) - __y; sum = __t; }
+        #define CALLBACK(idx,value, idx2) { let kahan_y = v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value) - c; let kahan_t = sum + kahan_y; c = (kahan_t - sum) - kahan_y; sum = kahan_t; }
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
