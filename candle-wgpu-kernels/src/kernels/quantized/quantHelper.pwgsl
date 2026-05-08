@@ -113,38 +113,17 @@ fn matmul_naive_block(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let m_input2_offset = (input2_offset + op_matmul_k * x//+ b * input2_stride_b
         ) / BLOCK_SIZE;
 
-    // Per-block partial summation (structural pairwise reduction).
-    //
-    // Original `sum += a * b` over 2048 elements produces O(n*eps)
-    // rounding error in f32 — observed as 0.5-0.7% rel L2 drift per
-    // matmul versus CPU's i32-accumulated `vec_dot_q4k_q8k`. Stacked
-    // across 35 layers × ~6 matmuls each, the drift compounds into
-    // the verbose-no-EOS symptom on the chat-pwa.
-    //
-    // Kahan compensated summation reduces the error in theory but
-    // is fragile — Tint and other shader compilers fold the
-    // compensation term away as `(t - sum) - y == 0`.
-    //
-    // This formulation is structurally pairwise: each Q4_K block
-    // (256 elements) sums into a fresh per-block f32 register, and
-    // the 8 block partials are added to the global sum. The compiler
-    // cannot fold this because `block_sum` is initialized fresh per
-    // iteration and the partial-add is a real dependency. Error
-    // grows as O(log N * eps) rather than O(N * eps); for n=2048
-    // that's roughly 64 ULPs worst-case vs 2048 ULPs.
     var sum = ZERO;
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        var block_sum = ZERO;
-        #define CALLBACK(idx,value, idx2) block_sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
+        #define CALLBACK(idx,value, idx2) sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
             LOAD_SINGLE(v_input2_u32, tid)
         }
 
-        sum += block_sum;
         blk += 1u;
     }
     v_dest[b * output_size_of_one_batch +
@@ -173,20 +152,17 @@ fn matmul_naive_block_m1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let m_input2_offset = (input2_offset + op_matmul_k * x// + b * input2_stride_b
     ) / BLOCK_SIZE;
 
-    // Per-block partial summation — see matmul_naive_block above.
     var sum = ZERO;
     var blk = 0u;
     for (var k = 0u; k < op_matmul_k; k+=u32(BLOCK_SIZE)){
         let block_index = blk+m_input2_offset ;
-        var block_sum = ZERO;
-        #define CALLBACK(idx,value, idx2) block_sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
+        #define CALLBACK(idx,value, idx2) sum += v_input1[op_matmul_input1_stride_k * (k + (idx)) + m_input1_offset] * (value);
         LOAD_HEADER(v_input2_u32)
 
         for(var tid = 0u; tid < TID_SIZE; tid += 1u){
             LOAD_SINGLE(v_input2_u32, tid)
         }
 
-        sum += block_sum;
         blk += 1u;
     }
     v_dest[b * output_size_of_one_batch +
