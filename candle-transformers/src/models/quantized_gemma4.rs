@@ -73,6 +73,100 @@ macro_rules! wasm_trace {
     }};
 }
 
+/// Layer-by-layer tensor dump for cross-device bisection.
+///
+/// When env var `CANDLE_BISECT_DUMP_DIR` is set to a directory, every
+/// instrumented checkpoint inside `DecoderLayer::forward` and
+/// `ModelWeights::forward` writes the tensor's contents to a file
+/// named `<dir>/step{step}_layer{layer}_{label}.bin`.
+///
+/// File format (compact, no external deps):
+///   - 4 bytes: magic `b"BST1"`
+///   - 1 byte: rank
+///   - rank × 8 bytes: little-endian u64 dim sizes
+///   - 1 byte: dtype tag (0=F32, 1=F16, 2=BF16, 3=U32, 4=I64)
+///   - remainder: raw bytes (always cast to F32 on dump)
+///
+/// Run native CPU and native WGPU with the same prompt + same dump
+/// dir prefix, then run `gemma4_bisect_diff` to find the first layer
+/// where outputs diverge. Native-only first; if native WGPU matches
+/// CPU, the remaining browser drift is Tint-specific MSL precision.
+#[cfg(not(target_arch = "wasm32"))]
+mod bisect {
+    use super::*;
+    use std::io::Write;
+
+    pub fn enabled() -> Option<std::path::PathBuf> {
+        std::env::var_os("CANDLE_BISECT_DUMP_DIR").map(std::path::PathBuf::from)
+    }
+
+    pub fn dump(
+        dir: &std::path::Path,
+        step: usize,
+        layer: usize,
+        label: &str,
+        tensor: &Tensor,
+    ) -> Result<()> {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| candle::Error::Msg(format!("bisect mkdir: {e}")))?;
+        let f32_t = tensor.contiguous()?.to_dtype(DType::F32)?;
+        let dims = f32_t.dims().to_vec();
+        let flat: Vec<f32> = f32_t.flatten_all()?.to_vec1::<f32>()?;
+        let path = dir.join(format!("step{step:04}_layer{layer:03}_{label}.bin"));
+        let mut f = std::fs::File::create(&path)
+            .map_err(|e| candle::Error::Msg(format!("bisect open: {e}")))?;
+        f.write_all(b"BST1")
+            .map_err(|e| candle::Error::Msg(format!("bisect write magic: {e}")))?;
+        f.write_all(&[dims.len() as u8])
+            .map_err(|e| candle::Error::Msg(format!("bisect write rank: {e}")))?;
+        for d in &dims {
+            f.write_all(&(*d as u64).to_le_bytes())
+                .map_err(|e| candle::Error::Msg(format!("bisect write dim: {e}")))?;
+        }
+        // dtype tag — always 0 (F32) since we cast above.
+        f.write_all(&[0u8])
+            .map_err(|e| candle::Error::Msg(format!("bisect write dtype: {e}")))?;
+        // Write f32 values as little-endian bytes without depending on
+        // bytemuck. Buffer in 4 KB chunks to keep syscall count low.
+        let mut buf: Vec<u8> = Vec::with_capacity(flat.len() * 4);
+        for v in &flat {
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        f.write_all(&buf)
+            .map_err(|e| candle::Error::Msg(format!("bisect write data: {e}")))?;
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+mod bisect {
+    use super::*;
+    pub fn enabled() -> Option<std::path::PathBuf> {
+        None
+    }
+    pub fn dump(
+        _dir: &std::path::Path,
+        _step: usize,
+        _layer: usize,
+        _label: &str,
+        _tensor: &Tensor,
+    ) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Macro: dump the tensor when bisect mode is on. No-op otherwise.
+/// Reads (step, layer) from the local-scope vars `_bisect_step` and
+/// `_bisect_layer` — callers wire these in via `let _bisect_step = ...`.
+macro_rules! bisect_dump {
+    ($dir:expr, $step:expr, $layer:expr, $label:expr, $tensor:expr) => {{
+        if let Some(dir) = &$dir {
+            // Errors during dump should not break inference.
+            let _ = bisect::dump(dir, $step, $layer, $label, $tensor);
+        }
+    }};
+}
+
 /// Row-wise embedding lookup against a quantized table — equivalent to
 /// `ggml_get_rows(qtensor, ids)` in llama.cpp. Holds the QTensor as-is
 /// and dequantizes only the rows referenced by each forward call.
@@ -839,10 +933,20 @@ impl DecoderLayer {
                 }
             };
         }
+        // Cross-device bisect: layer-by-layer tensor dump. Active when
+        // `CANDLE_BISECT_DUMP_DIR` env var is set. Dumps at each
+        // architecturally-meaningful checkpoint so a CPU-vs-WGPU diff
+        // identifies the first kernel that diverges.
+        let bdir = bisect::enabled();
+        let layer_idx = self.self_attn.layer_idx;
+        let step = seqlen_offset;
+
         let residual = xs;
         check_nan!(xs, "L:input");
+        bisect_dump!(bdir, step, layer_idx, "00_input", xs);
         let normed_input = self.input_layernorm.forward(xs)?;
         check_nan!(normed_input, "L:input_layernorm");
+        bisect_dump!(bdir, step, layer_idx, "01_input_layernorm", &normed_input);
         let attn = self.self_attn.forward(
             &normed_input,
             attention_mask,
@@ -851,8 +955,10 @@ impl DecoderLayer {
             shared_kv_store,
         )?;
         check_nan!(attn, "L:self_attn");
+        bisect_dump!(bdir, step, layer_idx, "02_self_attn", &attn);
         let attn = self.post_attention_layernorm.forward(&attn)?;
         check_nan!(attn, "L:post_attention_layernorm");
+        bisect_dump!(bdir, step, layer_idx, "03_post_attn_norm", &attn);
         // LaurelBlock merges with the attention output before the
         // first residual add: `attn = (attn + laurel(normed_input)) * inv_sqrt_2`.
         let attn = if let Some(laurel) = &self.laurel {
@@ -861,18 +967,24 @@ impl DecoderLayer {
         } else {
             attn
         };
+        bisect_dump!(bdir, step, layer_idx, "04_attn_post_laurel", &attn);
         let xs = (attn + residual)?;
         check_nan!(xs, "L:attn+residual");
+        bisect_dump!(bdir, step, layer_idx, "05_after_residual_1", &xs);
 
         let residual = &xs;
         let normed = self.pre_feedforward_layernorm.forward(&xs)?;
         check_nan!(normed, "L:pre_ff_norm");
+        bisect_dump!(bdir, step, layer_idx, "06_pre_ff_norm", &normed);
         let mlp_out = self.mlp.forward(&normed)?;
         check_nan!(mlp_out, "L:mlp");
+        bisect_dump!(bdir, step, layer_idx, "07_mlp", &mlp_out);
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
         check_nan!(mlp_out, "L:post_ff_norm");
+        bisect_dump!(bdir, step, layer_idx, "08_post_ff_norm", &mlp_out);
         let xs = (residual + mlp_out)?;
         check_nan!(xs, "L:final");
+        bisect_dump!(bdir, step, layer_idx, "09_after_residual_2", &xs);
 
         // PLE side-channel — gate(h) → act → * per_layer_input → proj
         // → norm → +residual. All four components must be present.
@@ -892,15 +1004,18 @@ impl DecoderLayer {
         } else {
             xs
         };
+        bisect_dump!(bdir, step, layer_idx, "10_after_ple", &xs);
 
         // Per-layer learned gain (Gemma 4 specifically — initialised to
         // 1.0 and trained per layer). Without this multiply the
         // residual stream `abs_max` runs away on E2B.
-        if let Some(scalar) = &self.layer_scalar {
-            xs.broadcast_mul(scalar)
+        let out = if let Some(scalar) = &self.layer_scalar {
+            xs.broadcast_mul(scalar)?
         } else {
-            Ok(xs)
-        }
+            xs
+        };
+        bisect_dump!(bdir, step, layer_idx, "11_layer_out", &out);
+        Ok(out)
     }
 
     /// AltUp forward — `xs` is `[num_inputs, B, T, hidden]`, returns
@@ -1614,10 +1729,20 @@ impl ModelWeights {
             wasm_trace!("layer loop done ({} layers)", self.layers.len());
             self.norm.forward(&hidden)?
         };
+        // Bisect dump: final hidden after norm, layer "999" reserved
+        // for model-level checkpoints.
+        {
+            let bdir = bisect::enabled();
+            bisect_dump!(bdir, seqlen_offset, 999usize, "98_post_norm", &hidden);
+        }
         // Take the last token only for autoregressive sampling — same as
         // gemma4/text.rs.
         let hidden = hidden.i((.., q_len - 1, ..))?.unsqueeze(1)?;
         let logits = self.lm_head.forward(&hidden)?;
+        {
+            let bdir = bisect::enabled();
+            bisect_dump!(bdir, seqlen_offset, 999usize, "99_logits_pre_softcap", &logits);
+        }
         // Final-logit softcap: tanh(logits / softcap) * softcap.
         //
         // Cast to F32 first. Tanh in BF16/F16 saturates with very poor
