@@ -603,16 +603,25 @@ impl Attention {
     ) -> Result<Tensor> {
         let (b_sz, q_len, _) = xs.dims3()?;
 
+        // Sub-layer bisect dumps. Naming: `A.NN_subop` so the existing
+        // `02_self_attn` sits at the END after all sub-ops. Lets the
+        // diff tool localize drift within a single attention block.
+        let bdir = bisect::enabled();
+        let step = seqlen_offset;
+        let li = self.layer_idx;
+
         // Q is always projected from the layer's own input — receivers
         // share K/V with their donor but keep their own Q. RmsNorm
         // requires contiguous input; the reshape+transpose may yield a
         // non-contiguous tensor (q_len > 1 prefill case).
         let q = self.q_proj.forward(xs)?;
+        bisect_dump!(bdir, step, li, "A01_q_proj", &q);
         let q = q
             .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             .transpose(1, 2)?
             .contiguous()?;
         let q = self.q_norm.forward(&q)?;
+        bisect_dump!(bdir, step, li, "A02_q_norm", &q);
 
         // Q's RoPE comes from THIS layer's RoPE table either way. For
         // donors we'll co-rotate q+k; for receivers we rotate only q
@@ -652,7 +661,9 @@ impl Attention {
                 "quantized_gemma4: donor layer is missing its k_norm".into(),
             ))?;
             let k = k_proj.forward(xs)?;
+            bisect_dump!(bdir, step, li, "A03_k_proj", &k);
             let v = v_proj.forward(xs)?;
+            bisect_dump!(bdir, step, li, "A04_v_proj", &v);
             let k = k
                 .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?
                 .transpose(1, 2)?
@@ -662,7 +673,9 @@ impl Attention {
                 .transpose(1, 2)?
                 .contiguous()?;
             let k = k_norm.forward(&k)?;
+            bisect_dump!(bdir, step, li, "A05_k_norm", &k);
             let v = v_norm(&v, self.rms_norm_eps)?;
+            bisect_dump!(bdir, step, li, "A06_v_norm", &v);
             // q and k must share the rotated dimension; co-rotate.
             let (q_rot, k_rot) = if self.is_sliding {
                 self.rotary_emb_local
@@ -671,15 +684,21 @@ impl Attention {
                 self.rotary_emb_global
                     .apply_rotary_emb_qkv(&q, &k, seqlen_offset)?
             };
+            bisect_dump!(bdir, step, li, "A07_q_rope", &q_rot);
+            bisect_dump!(bdir, step, li, "A08_k_rope", &k_rot);
             let v = v.contiguous()?;
             let k = k_rot.contiguous()?;
             let (k_full, v_full) = self.kv_cache.append(&k, &v)?;
+            bisect_dump!(bdir, step, li, "A09_k_cache", &k_full);
+            bisect_dump!(bdir, step, li, "A10_v_cache", &v_full);
             shared_kv_store[self.layer_idx] = Some((k_full.clone(), v_full.clone()));
             (q_rot, k_full, v_full)
         };
 
         let k = crate::utils::repeat_kv(k_full, self.num_kv_groups)?.contiguous()?;
         let v = crate::utils::repeat_kv(v_full, self.num_kv_groups)?.contiguous()?;
+        bisect_dump!(bdir, step, li, "A11_k_after_repeat", &k);
+        bisect_dump!(bdir, step, li, "A12_v_after_repeat", &v);
 
         // Gemma 4 sets pre-softmax scale to 1.0 — q_norm/k_norm produce
         // unit-magnitude queries/keys so the dot-products are already
@@ -702,18 +721,24 @@ impl Attention {
         // by the GPU→CPU argmax readback (~330 ms/token) anyway, not
         // by attention, so end-to-end perf is unchanged.
         let attn_weights = q.matmul(&k.transpose(2, 3)?.contiguous()?)?;
+        bisect_dump!(bdir, step, li, "A13_qk_scores", &attn_weights);
         let mask = if self.is_sliding { sliding_attention_mask } else { attention_mask };
         let attn_weights = match mask {
             Some(m) => attn_weights.broadcast_add(m)?,
             None => attn_weights,
         };
+        bisect_dump!(bdir, step, li, "A14_qk_masked", &attn_weights);
         let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        bisect_dump!(bdir, step, li, "A15_softmax", &attn_weights);
         let attn_output = attn_weights.matmul(&v)?;
+        bisect_dump!(bdir, step, li, "A16_attn_v", &attn_output);
 
         let attn_output = attn_output
             .transpose(1, 2)?
             .reshape((b_sz, q_len, self.num_heads * self.head_dim))?;
-        self.o_proj.forward(&attn_output)
+        let out = self.o_proj.forward(&attn_output)?;
+        bisect_dump!(bdir, step, li, "A17_o_proj", &out);
+        Ok(out)
     }
 
     fn clear_kv_cache(&mut self) {
